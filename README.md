@@ -112,7 +112,15 @@ Add to `opencode.jsonc`:
 }
 ```
 
-> **Note:** The plugin is loaded from npm via the `plugin` array. For local development, you can also place `plugin.ts` in `.opencode/plugins/` — see [OpenCode Plugins](https://opencode.ai/docs/plugins/).
+> **Note:** The plugin is loaded from npm via the `plugin` array. For local development or GitHub installs, use:
+>
+> ```bash
+> bun add "github:OpenJE/opencode-openje#main"
+> ```
+>
+> Then add `"opencode-openje"` to the `plugin` array in `opencode.jsonc`. OpenCode will auto-install the package on startup.
+>
+> You can also place `plugin.ts` directly in `.opencode/plugins/` — see [OpenCode Plugins](https://opencode.ai/docs/plugins/).
 
 ### Plugin Return Format
 

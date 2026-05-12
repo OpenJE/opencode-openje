@@ -3,18 +3,18 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
+  "main": "dist/index.js",
   "files": [
     "dist"
   ],
   "exports": {
-    ".": "./dist/index.js",
-    "./opencode": "./dist/opencode/plugin.js",
-    "./core": "./dist/core/index.js"
+    ".": "./dist/index.js"
   },
   "scripts": {
-    "build": "bun build ./src/index.ts --outdir=dist --target=bun",
+    "build": "bun build ./src/index.ts --outdir=dist --target=bun --external @opencode-ai/plugin",
     "check": "tsc --noEmit",
-    "test": "bun test"
+    "test": "bun test",
+    "prepare": "bun run build"
   },
   "devDependencies": {
     "@opencode-ai/plugin": "^1.14.48",

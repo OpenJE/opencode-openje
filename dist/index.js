@@ -1,14 +1,21 @@
 // @bun
 var __defProp = Object.defineProperty;
+var __returnValue = (v) => v;
+function __exportSetter(name, newValue) {
+  this[name] = __returnValue.bind(null, newValue);
+}
 var __export = (target, all) => {
   for (var name in all)
     __defProp(target, name, {
       get: all[name],
       enumerable: true,
       configurable: true,
-      set: (newValue) => all[name] = () => newValue
+      set: __exportSetter.bind(all, name)
     });
 };
+
+// src/opencode/plugin.ts
+import { tool } from "@opencode-ai/plugin";
 
 // src/db/connection.ts
 import { Database } from "bun:sqlite";
@@ -5070,32 +5077,6 @@ class ReProgress {
     closeDatabase(this.db);
   }
 }
-// src/core/errors.ts
-class ReProgressError extends Error {
-  code;
-  details;
-  constructor(code, message, details = {}) {
-    super(message);
-    this.name = "ReProgressError";
-    this.code = code;
-    this.details = details;
-  }
-}
-function formatError(error) {
-  return {
-    ok: false,
-    error: {
-      code: error.code,
-      message: error.message,
-      details: error.details
-    }
-  };
-}
-function formatSuccess(data) {
-  return { ok: true, data };
-}
-// src/opencode/plugin.ts
-import { tool } from "@opencode-ai/plugin";
 
 // src/opencode/result.ts
 function jsonResult(data, metadata) {
@@ -5319,9 +5300,38 @@ var OpenJePlugin = async ({ client, directory, worktree }) => {
     }
   };
 };
+// src/core/errors.ts
+class ReProgressError extends Error {
+  code;
+  details;
+  constructor(code, message, details = {}) {
+    super(message);
+    this.name = "ReProgressError";
+    this.code = code;
+    this.details = details;
+  }
+}
+function formatError(error) {
+  return {
+    ok: false,
+    error: {
+      code: error.code,
+      message: error.message,
+      details: error.details
+    }
+  };
+}
+function formatSuccess(data) {
+  return { ok: true, data };
+}
+
+// src/index.ts
+var pluginModule = { id: "opencode-openje", server: OpenJePlugin };
+var src_default = pluginModule;
 export {
   formatSuccess,
   formatError,
+  src_default as default,
   ReProgressError,
   ReProgress,
   OpenJePlugin

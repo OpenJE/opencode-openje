@@ -17,11 +17,18 @@
     "prepare": "bun run build"
   },
   "devDependencies": {
-    "@opencode-ai/plugin": "^1.14.48",
     "@types/node": "^22.15.3",
     "bun-types": "latest",
     "typescript": "^5.8.3",
     "zod": "^3.22.0"
+  },
+  "peerDependencies": {
+    "@opencode-ai/plugin": "^1.14.48"
+  },
+  "peerDependenciesMeta": {
+    "@opencode-ai/plugin": {
+      "optional": true
+    }
   },
   "opencode": {
     "type": "plugin",

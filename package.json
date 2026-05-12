@@ -1,0 +1,25 @@
+{
+  "name": "opencode-openje",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "files": [
+    "dist"
+  ],
+  "exports": {
+    ".": "./dist/index.js",
+    "./opencode": "./dist/opencode/plugin.js",
+    "./core": "./dist/core/index.js"
+  },
+  "scripts": {
+    "build": "bun build ./src/index.ts --outdir=dist --target=bun",
+    "check": "tsc --noEmit",
+    "test": "bun test"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.3",
+    "bun-types": "latest",
+    "typescript": "^5.8.3",
+    "zod": "^3.22.0"
+  }
+}

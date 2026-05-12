@@ -107,15 +107,21 @@ Add to `opencode.jsonc`:
 
 ```jsonc
 {
-  "$schema": "https://opencode.ai/schema.json",
-  "plugins": [
-    {
-      "package": "opencode-openje",
-      "export": "OpenJePlugin"
-    }
-  ]
+  "$schema": "https://opencode.ai/config.json",
+  "plugin": ["opencode-openje"]
 }
 ```
+
+> **Note:** The plugin is loaded from npm via the `plugin` array. For local development, you can also place `plugin.ts` in `.opencode/plugins/` — see [OpenCode Plugins](https://opencode.ai/docs/plugins/).
+
+### Plugin Return Format
+
+All 13 tools use the official `@opencode-ai/plugin` SDK's `tool()` helper with Zod-validated schemas. Tools return `ToolResult` format: `string | { output: string; metadata?: Record<string, any> }`.
+
+- **Success**: `{ output: "<json-stringified data>" }` or plain string
+- **Error**: `{ output: "{\"error\":{\"message\":\"...\",\"code\":\"...\"}}" }`
+
+Example: `re_status` returns JSON with function/edge/job counts; `re_function_get` on missing function returns error JSON.
 
 ## Architecture
 

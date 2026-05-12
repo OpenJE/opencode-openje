@@ -1,7 +1,8 @@
-import type { Plugin } from "@opencode-ai/plugin";
+import type { Plugin, ToolContext } from "@opencode-ai/plugin";
+import { tool } from "@opencode-ai/plugin";
 import { ReProgress } from "../core/ReProgress.js";
-import { formatError, formatSuccess } from "../core/format.js";
-import { ReProgressError } from "../core/errors.js";
+import { jsonResult, errorResult } from "./result.js";
+import type { FunctionStatus, EdgeKind, JobType } from "../db/types.js";
 
 export const OpenJePlugin: Plugin = async ({ client, directory, worktree }) => {
   const root = worktree || directory || process.cwd();
@@ -18,10 +19,10 @@ export const OpenJePlugin: Plugin = async ({ client, directory, worktree }) => {
 
   return {
     tool: {
-      re_status: {
+      re_status: tool({
         description: "Show overall status of the RE progress ledger",
         args: {},
-        async execute() {
+        async execute(_args, _ctx: ToolContext) {
           const counts = {
             functions: re.functions.listAll().then((r) => r.length),
             edges: re.edges.listAll().then((r) => r.length),
@@ -32,7 +33,7 @@ export const OpenJePlugin: Plugin = async ({ client, directory, worktree }) => {
             source_symbols: re.sourceSymbols.list({}).then((r) => r.length),
             source_blocks: 0,
           };
-          return formatSuccess({
+          return jsonResult({
             functions: await counts.functions,
             edges: await counts.edges,
             jobs: await counts.jobs,
@@ -43,124 +44,126 @@ export const OpenJePlugin: Plugin = async ({ client, directory, worktree }) => {
             source_blocks: await counts.source_blocks,
           });
         },
-      },
+      }),
 
-      re_function_register: {
+      re_function_register: tool({
         description: "Register a function in the ledger",
         args: {
-          ea: { type: "string", description: "Function effective address" },
-          status: { type: "string", description: "Function status", optional: true },
-          last_pseudocode_hash: { type: "string", description: "Hash of pseudocode", optional: true },
+          ea: tool.schema.string().describe("Function effective address"),
+          status: tool.schema.enum(["unknown", "discovered", "queued", "waiting_on_children", "ready_for_local_analysis", "analyzing", "worker_done", "review_pending", "reviewed", "failed", "skipped", "cycle_member", "stale"]).describe("Function status").optional(),
+          last_pseudocode_hash: tool.schema.string().describe("Hash of pseudocode").optional(),
         },
-        async execute(args: any) {
+        async execute(args, _ctx: ToolContext) {
           await re.functions.register({
             ea: args.ea,
-            status: args.status,
+            status: args.status as FunctionStatus | undefined,
             lastPseudocodeHash: args.last_pseudocode_hash,
           });
-          return formatSuccess({ registered: args.ea });
+          return jsonResult({ registered: args.ea });
         },
-      },
+      }),
 
-      re_function_get: {
+      re_function_get: tool({
         description: "Get a function by EA",
         args: {
-          ea: { type: "string", description: "Function effective address" },
+          ea: tool.schema.string().describe("Function effective address"),
         },
-        async execute(args: any) {
+        async execute(args, _ctx: ToolContext) {
           const fn = await re.functions.get(args.ea);
-          if (!fn) throw new ReProgressError("NOT_FOUND", `Function ${args.ea} not found`);
-          return formatSuccess(fn);
+          if (!fn) {
+            return errorResult(`Function ${args.ea} not found`, "NOT_FOUND");
+          }
+          return jsonResult(fn);
         },
-      },
+      }),
 
-      re_function_set_status: {
+      re_function_set_status: tool({
         description: "Set function status",
         args: {
-          ea: { type: "string", description: "Function effective address" },
-          status: { type: "string", description: "New status" },
+          ea: tool.schema.string().describe("Function effective address"),
+          status: tool.schema.enum(["unknown", "discovered", "queued", "waiting_on_children", "ready_for_local_analysis", "analyzing", "worker_done", "review_pending", "reviewed", "failed", "skipped", "cycle_member", "stale"]).describe("New status"),
         },
-        async execute(args: any) {
-          await re.functions.setStatus(args.ea, args.status);
-          return formatSuccess({ updated: args.ea, status: args.status });
+        async execute(args, _ctx: ToolContext) {
+          await re.functions.setStatus(args.ea, args.status as FunctionStatus);
+          return jsonResult({ updated: args.ea, status: args.status });
         },
-      },
+      }),
 
-      re_function_list: {
+      re_function_list: tool({
         description: "List functions by status",
         args: {
-          status: { type: "string", description: "Filter by status", optional: true },
+          status: tool.schema.enum(["unknown", "discovered", "queued", "waiting_on_children", "ready_for_local_analysis", "analyzing", "worker_done", "review_pending", "reviewed", "failed", "skipped", "cycle_member", "stale"]).describe("Filter by status").optional(),
         },
-        async execute(args: any) {
+        async execute(args, _ctx: ToolContext) {
           const list = args.status
-            ? await re.functions.listByStatus(args.status)
+            ? await re.functions.listByStatus(args.status as FunctionStatus)
             : await re.functions.listAll();
-          return formatSuccess({ count: list.length, functions: list });
+          return jsonResult({ count: list.length, functions: list });
         },
-      },
+      }),
 
-      re_edge_add: {
+      re_edge_add: tool({
         description: "Add an edge between functions",
         args: {
-          caller: { type: "string", description: "Caller EA" },
-          callee: { type: "string", description: "Callee EA" },
-          kind: { type: "string", description: "Edge kind" },
-          blocking: { type: "boolean", description: "Whether blocking", optional: true },
-          reason: { type: "string", description: "Reason", optional: true },
+          caller: tool.schema.string().describe("Caller EA"),
+          callee: tool.schema.string().describe("Callee EA"),
+          kind: tool.schema.enum(["direct_call", "indirect_call", "virtual_call", "import_call", "thunk", "tail_call", "callback_candidate", "unresolved"]).describe("Edge kind"),
+          blocking: tool.schema.boolean().describe("Whether blocking").optional(),
+          reason: tool.schema.string().describe("Reason").optional(),
         },
-        async execute(args: any) {
+        async execute(args, _ctx: ToolContext) {
           await re.edges.add({
             caller: args.caller,
             callee: args.callee,
-            kind: args.kind,
+            kind: args.kind as EdgeKind,
             blocking: args.blocking ?? true,
             reason: args.reason,
           });
-          return formatSuccess({ added: `${args.caller} -> ${args.callee}` });
+          return jsonResult({ added: `${args.caller} -> ${args.callee}` });
         },
-      },
+      }),
 
-      re_job_create: {
+      re_job_create: tool({
         description: "Create a job",
         args: {
-          job_type: { type: "string", description: "Job type" },
-          target: { type: "string", description: "Target EA" },
-          role: { type: "string", description: "Agent role", optional: true },
-          input_path: { type: "string", description: "Input path", optional: true },
+          job_type: tool.schema.enum(["discover_subgraph", "classify_edges", "analyze_function_semantics", "analyze_function_types", "analyze_function_names", "review_function_contract", "analyze_scc_cluster", "emit_faithful_cpp", "review_cpp_fidelity", "fix_compile_error", "apply_ida_patch_plan"]).describe("Job type"),
+          target: tool.schema.string().describe("Target EA"),
+          role: tool.schema.string().describe("Agent role").optional(),
+          input_path: tool.schema.string().describe("Input path").optional(),
         },
-        async execute(args: any) {
+        async execute(args, _ctx: ToolContext) {
           const job = await re.jobs.create({
-            jobType: args.job_type,
+            jobType: args.job_type as JobType,
             target: args.target,
             agentRole: args.role,
             inputPath: args.input_path,
           });
-          return formatSuccess(job);
+          return jsonResult(job);
         },
-      },
+      }),
 
-      re_job_next: {
+      re_job_next: tool({
         description: "Claim next available job",
         args: {
-          role: { type: "string", description: "Agent role filter", optional: true },
+          role: tool.schema.string().describe("Agent role filter").optional(),
         },
-        async execute(args: any) {
+        async execute(args, _ctx: ToolContext) {
           const job = await re.jobs.next(args.role ? { role: args.role } : undefined);
-          if (!job) return formatSuccess(null);
-          return formatSuccess(job);
+          if (!job) return jsonResult(null);
+          return jsonResult(job);
         },
-      },
+      }),
 
-      re_worker_submit: {
+      re_worker_submit: tool({
         description: "Submit worker run output",
         args: {
-          function_ea: { type: "string", description: "Function EA" },
-          role: { type: "string", description: "Worker role" },
-          model: { type: "string", description: "Model name" },
-          output: { type: "object", description: "Worker output JSON" },
-          job_id: { type: "string", description: "Job ID", optional: true },
+          function_ea: tool.schema.string().describe("Function EA"),
+          role: tool.schema.string().describe("Worker role"),
+          model: tool.schema.string().describe("Model name"),
+          output: tool.schema.object({}).describe("Worker output JSON"),
+          job_id: tool.schema.string().describe("Job ID").optional(),
         },
-        async execute(args: any) {
+        async execute(args, _ctx: ToolContext) {
           const id = await re.workers.submit({
             jobId: args.job_id,
             functionEa: args.function_ea,
@@ -168,59 +171,59 @@ export const OpenJePlugin: Plugin = async ({ client, directory, worktree }) => {
             model: args.model,
             output: args.output,
           });
-          return formatSuccess({ id });
+          return jsonResult({ id });
         },
-      },
+      }),
 
-      re_review_submit: {
+      re_review_submit: tool({
         description: "Submit a review contract",
         args: {
-          function_ea: { type: "string", description: "Function EA" },
-          reviewer_model: { type: "string", description: "Reviewer model" },
-          contract: { type: "object", description: "Accepted contract JSON" },
-          rejected_claims: { type: "array", description: "Rejected claims", optional: true },
+          function_ea: tool.schema.string().describe("Function EA"),
+          reviewer_model: tool.schema.string().describe("Reviewer model"),
+          contract: tool.schema.object({}).describe("Accepted contract JSON"),
+          rejected_claims: tool.schema.array(tool.schema.string()).describe("Rejected claims").optional(),
         },
-        async execute(args: any) {
+        async execute(args, _ctx: ToolContext) {
           await re.reviews.submit({
             functionEa: args.function_ea,
             reviewerModel: args.reviewer_model,
             acceptedContract: args.contract,
             rejectedClaims: args.rejected_claims,
           });
-          return formatSuccess({ reviewed: args.function_ea });
+          return jsonResult({ reviewed: args.function_ea });
         },
-      },
+      }),
 
-      re_stale_mark_parents: {
+      re_stale_mark_parents: tool({
         description: "Mark parents stale when child changes",
         args: {
-          child_ea: { type: "string", description: "Child function EA" },
+          child_ea: tool.schema.string().describe("Child function EA"),
         },
-        async execute(args: any) {
+        async execute(args, _ctx: ToolContext) {
           const parents = await re.stale.markParentsStale(args.child_ea);
-          return formatSuccess({ marked: parents });
+          return jsonResult({ marked: parents });
         },
-      },
+      }),
 
-      re_stale_list: {
+      re_stale_list: tool({
         description: "List all stale functions",
         args: {},
-        async execute() {
+        async execute(_args, _ctx: ToolContext) {
           const list = await re.stale.list();
-          return formatSuccess({ count: list.length, functions: list });
+          return jsonResult({ count: list.length, functions: list });
         },
-      },
+      }),
 
-      re_tree: {
+      re_tree: tool({
         description: "Get status tree from root",
         args: {
-          root_ea: { type: "string", description: "Root function EA" },
+          root_ea: tool.schema.string().describe("Root function EA"),
         },
-        async execute(args: any) {
+        async execute(args, _ctx: ToolContext) {
           const tree = await re.tree.statusTree(args.root_ea);
-          return formatSuccess(tree);
+          return jsonResult(tree);
         },
-      },
+      }),
     },
   };
 };

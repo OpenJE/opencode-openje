@@ -6,9 +6,6 @@ import { FunctionAnalysisV1 } from "./FunctionAnalysisV1.js";
 describe("FunctionAnalysisV1", () => {
   it("parses a valid worker hypothesis and applies array defaults", () => {
     const parsed = FunctionAnalysisV1.parse({
-      function_ea: "0x140012340",
-      role: "semantics_worker",
-      model: "qwen",
       purpose: {
         summary: "Initializes the renderer",
         confidence: 0.82,
@@ -23,10 +20,6 @@ describe("FunctionAnalysisV1", () => {
 
   it("accepts optional input and return value details", () => {
     const parsed = FunctionAnalysisV1.parse({
-      job_id: "job-1",
-      function_ea: "0x140012340",
-      role: "semantics_worker",
-      model: "qwen",
       purpose: {
         summary: "Formats a string",
         confidence: 1,
@@ -57,9 +50,6 @@ describe("FunctionAnalysisV1", () => {
     expect(() => FunctionAnalysisV1.parse({})).toThrow(ZodError);
     expect(() =>
       FunctionAnalysisV1.parse({
-        function_ea: "0x140012340",
-        role: "semantics_worker",
-        model: "qwen",
         purpose: {
           summary: "Too certain",
           confidence: 1.1,
@@ -67,5 +57,17 @@ describe("FunctionAnalysisV1", () => {
         },
       }),
     ).toThrow(ZodError);
+  });
+
+  it("accepts minimal valid payload with just purpose", () => {
+    const parsed = FunctionAnalysisV1.parse({
+      purpose: {
+        summary: "Test function",
+        confidence: 0.5,
+        evidence: [],
+      },
+    });
+
+    expect(parsed.purpose.summary).toBe("Test function");
   });
 });

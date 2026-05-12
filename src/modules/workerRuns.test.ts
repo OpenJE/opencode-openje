@@ -4,9 +4,6 @@ import { runMigrations } from "../db/migrations.js";
 import { WorkerRunsModule } from "./workerRuns.js";
 
 const validAnalysis = {
-  function_ea: "0x140012340",
-  role: "semantic-analysis",
-  model: "test-model",
   purpose: {
     summary: "Validates the incoming buffer length before parsing.",
     confidence: 0.82,
@@ -69,7 +66,13 @@ describe("WorkerRunsModule", () => {
       output_path: null,
     });
     expect(run!.created_at).toBeString();
-    expect(JSON.parse(run!.output_json)).toEqual(validAnalysis);
+    expect(JSON.parse(run!.output_json)).toEqual({
+      function_ea: "0x140012340",
+      role: "semantic-analysis",
+      model: "test-model",
+      job_id: "job-1",
+      ...validAnalysis,
+    });
   });
 
   test("submit defaults optional database fields to null", async () => {
@@ -111,7 +114,7 @@ describe("WorkerRunsModule", () => {
     const run = await mod.get(id);
     expect(run).not.toBeNull();
     expect(run!.function_ea).toBe("0x140012340");
-    expect(JSON.parse(run!.output_json).function_ea).toBe("0xDEADBEEF");
+    expect(JSON.parse(run!.output_json).function_ea).toBe("0x140012340");
   });
 
   test("listForFunction returns runs for one function in insertion order", async () => {

@@ -4851,10 +4851,6 @@ class StatusTreeModule {
 
 // src/schemas/FunctionAnalysisV1.ts
 var FunctionAnalysisV1 = exports_external.object({
-  job_id: exports_external.string().optional(),
-  function_ea: exports_external.string(),
-  role: exports_external.string(),
-  model: exports_external.string(),
   purpose: exports_external.object({
     summary: exports_external.string(),
     confidence: exports_external.number().min(0).max(1),
@@ -4884,8 +4880,15 @@ class WorkerRunsModule {
     this.db = db;
   }
   async submit(input) {
-    const output = FunctionAnalysisV1.parse(input.output);
+    const parsed = FunctionAnalysisV1.parse(input.output);
     const createdAt = new Date().toISOString();
+    const analysis = {
+      function_ea: input.functionEa,
+      role: input.role,
+      model: input.model,
+      ...input.jobId ? { job_id: input.jobId } : {},
+      ...parsed
+    };
     const result = this.db.query(`INSERT INTO worker_runs (job_id, function_ea, role, model, input_hash, output_json, output_path, created_at)
          VALUES ($jobId, $functionEa, $role, $model, $inputHash, $outputJson, NULL, $createdAt);`).run({
       $jobId: input.jobId ?? null,
@@ -4893,7 +4896,7 @@ class WorkerRunsModule {
       $role: input.role,
       $model: input.model,
       $inputHash: input.inputHash ?? null,
-      $outputJson: JSON.stringify(output),
+      $outputJson: JSON.stringify(analysis),
       $createdAt: createdAt
     });
     return Number(result.lastInsertRowid);
@@ -5237,7 +5240,7 @@ var OpenJePlugin = async ({ client, directory, worktree }) => {
           function_ea: tool.schema.string().describe("Function EA"),
           role: tool.schema.string().describe("Worker role"),
           model: tool.schema.string().describe("Model name"),
-          output: tool.schema.string().describe("Worker output as JSON string"),
+          output: tool.schema.string().describe('Worker analysis as JSON. Required: {"purpose":{"summary":"...","confidence":0.85,"evidence":["..."]}}. Optional: inputs[], return_value, side_effects[], uncertainties[]'),
           job_id: tool.schema.string().describe("Job ID").optional()
         },
         async execute(args, _ctx) {
@@ -5256,7 +5259,7 @@ var OpenJePlugin = async ({ client, directory, worktree }) => {
         args: {
           function_ea: tool.schema.string().describe("Function EA"),
           reviewer_model: tool.schema.string().describe("Reviewer model"),
-          contract: tool.schema.string().describe("Accepted contract as JSON string"),
+          contract: tool.schema.string().describe('Accepted contract as JSON. Required: {"accepted_name":"...","kind":"function","purpose":"...","confidence":0.9}. Kind: function|method|constructor|destructor|thunk|unknown. Optional: accepted_prototype, owner, return_value, accepted_variable_names, dependencies_used, rejected_claims'),
           rejected_claims: tool.schema.string().describe("Rejected claims as JSON string array").optional()
         },
         async execute(args, _ctx) {

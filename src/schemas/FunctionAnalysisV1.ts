@@ -1,10 +1,6 @@
 import { z } from "zod";
 
 export const FunctionAnalysisV1 = z.object({
-  job_id: z.string().optional(),
-  function_ea: z.string(),
-  role: z.string(),
-  model: z.string(),
   purpose: z.object({
     summary: z.string(),
     confidence: z.number().min(0).max(1),

@@ -160,7 +160,7 @@ export const OpenJePlugin: Plugin = async ({ client, directory, worktree }) => {
           function_ea: tool.schema.string().describe("Function EA"),
           role: tool.schema.string().describe("Worker role"),
           model: tool.schema.string().describe("Model name"),
-          output: tool.schema.string().describe("Worker output as JSON string"),
+          output: tool.schema.string().describe('Worker analysis as JSON. Required: {"purpose":{"summary":"...","confidence":0.85,"evidence":["..."]}}. Optional: inputs[], return_value, side_effects[], uncertainties[]'),
           job_id: tool.schema.string().describe("Job ID").optional(),
         },
         async execute(args, _ctx: ToolContext) {
@@ -180,7 +180,7 @@ export const OpenJePlugin: Plugin = async ({ client, directory, worktree }) => {
         args: {
           function_ea: tool.schema.string().describe("Function EA"),
           reviewer_model: tool.schema.string().describe("Reviewer model"),
-          contract: tool.schema.string().describe("Accepted contract as JSON string"),
+          contract: tool.schema.string().describe('Accepted contract as JSON. Required: {"accepted_name":"...","kind":"function","purpose":"...","confidence":0.9}. Kind: function|method|constructor|destructor|thunk|unknown. Optional: accepted_prototype, owner, return_value, accepted_variable_names, dependencies_used, rejected_claims'),
           rejected_claims: tool.schema.string().describe("Rejected claims as JSON string array").optional(),
         },
         async execute(args, _ctx: ToolContext) {

@@ -15,8 +15,15 @@ export class WorkerRunsModule {
   constructor(private readonly db: Database) {}
 
   async submit(input: SubmitWorkerRunInput): Promise<number> {
-    const output = FunctionAnalysisV1.parse(input.output);
+    const parsed = FunctionAnalysisV1.parse(input.output);
     const createdAt = new Date().toISOString();
+    const analysis = {
+      function_ea: input.functionEa,
+      role: input.role,
+      model: input.model,
+      ...(input.jobId ? { job_id: input.jobId } : {}),
+      ...parsed,
+    };
     const result = this.db
       .query(
         `INSERT INTO worker_runs (job_id, function_ea, role, model, input_hash, output_json, output_path, created_at)
@@ -28,7 +35,7 @@ export class WorkerRunsModule {
         $role: input.role,
         $model: input.model,
         $inputHash: input.inputHash ?? null,
-        $outputJson: JSON.stringify(output),
+        $outputJson: JSON.stringify(analysis),
         $createdAt: createdAt,
       });
 

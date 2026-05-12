@@ -5237,7 +5237,7 @@ var OpenJePlugin = async ({ client, directory, worktree }) => {
           function_ea: tool.schema.string().describe("Function EA"),
           role: tool.schema.string().describe("Worker role"),
           model: tool.schema.string().describe("Model name"),
-          output: tool.schema.object({}).describe("Worker output JSON"),
+          output: tool.schema.string().describe("Worker output as JSON string"),
           job_id: tool.schema.string().describe("Job ID").optional()
         },
         async execute(args, _ctx) {
@@ -5246,7 +5246,7 @@ var OpenJePlugin = async ({ client, directory, worktree }) => {
             functionEa: args.function_ea,
             role: args.role,
             model: args.model,
-            output: args.output
+            output: JSON.parse(args.output)
           });
           return jsonResult({ id });
         }
@@ -5256,15 +5256,15 @@ var OpenJePlugin = async ({ client, directory, worktree }) => {
         args: {
           function_ea: tool.schema.string().describe("Function EA"),
           reviewer_model: tool.schema.string().describe("Reviewer model"),
-          contract: tool.schema.object({}).describe("Accepted contract JSON"),
-          rejected_claims: tool.schema.array(tool.schema.string()).describe("Rejected claims").optional()
+          contract: tool.schema.string().describe("Accepted contract as JSON string"),
+          rejected_claims: tool.schema.string().describe("Rejected claims as JSON string array").optional()
         },
         async execute(args, _ctx) {
           await re.reviews.submit({
             functionEa: args.function_ea,
             reviewerModel: args.reviewer_model,
-            acceptedContract: args.contract,
-            rejectedClaims: args.rejected_claims
+            acceptedContract: JSON.parse(args.contract),
+            rejectedClaims: args.rejected_claims ? JSON.parse(args.rejected_claims) : undefined
           });
           return jsonResult({ reviewed: args.function_ea });
         }

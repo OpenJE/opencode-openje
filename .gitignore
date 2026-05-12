@@ -1,5 +1,4 @@
 node_modules/
-ts/node_modules/
 
 # Devenv
 .devenv*

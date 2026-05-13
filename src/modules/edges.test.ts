@@ -3,6 +3,8 @@ import { Database } from "bun:sqlite";
 import { runMigrations } from "../db/migrations.js";
 import type { AddEdgeInput } from "../db/types.js";
 import { EdgesModule } from "./edges.js";
+import { InMemoryJsonStore } from "../persistence/JsonStore.js";
+import { analysisEdgeKey } from "../persistence/types.js";
 
 async function withEdges(testBody: (edges: EdgesModule, db: Database) => Promise<void>): Promise<void> {
   const db = new Database(":memory:");
@@ -10,6 +12,20 @@ async function withEdges(testBody: (edges: EdgesModule, db: Database) => Promise
 
   try {
     await testBody(new EdgesModule(db), db);
+  } finally {
+    db.close();
+  }
+}
+
+async function withEdgesAndJsonStore(
+  testBody: (edges: EdgesModule, db: Database, jsonStore: InMemoryJsonStore) => Promise<void>,
+): Promise<void> {
+  const db = new Database(":memory:");
+  runMigrations(db);
+  const jsonStore = new InMemoryJsonStore();
+
+  try {
+    await testBody(new EdgesModule(db, jsonStore), db, jsonStore);
   } finally {
     db.close();
   }
@@ -109,6 +125,53 @@ describe("EdgesModule", () => {
         ["0x1000", "0x3000"],
         ["0x4000", "0x2000"],
       ]);
+    });
+  });
+
+  test("writes to JSON store on add", async () => {
+    await withEdgesAndJsonStore(async (edges, _db, jsonStore) => {
+      await edges.add({ caller: "0x1000", callee: "0x2000", kind: "direct_call" });
+
+      const key = analysisEdgeKey("0x1000", "0x2000");
+      const data = await jsonStore.read("edges", key);
+
+      expect(data).toEqual({
+        caller_ea: "0x1000",
+        callee_ea: "0x2000",
+        edge_kind: "direct_call",
+        blocking: 1,
+        reason: null,
+        discovered_at: expect.any(String),
+      });
+    });
+  });
+
+  test("writes tombstone to JSON store on remove", async () => {
+    await withEdgesAndJsonStore(async (edges, _db, jsonStore) => {
+      await edges.add({ caller: "0x1000", callee: "0x2000", kind: "direct_call" });
+
+      const key = analysisEdgeKey("0x1000", "0x2000");
+      expect(await jsonStore.read("edges", key)).not.toBeNull();
+
+      await edges.remove("0x1000", "0x2000");
+
+      // Tombstone is written, so read returns null
+      expect(await jsonStore.read("edges", key)).toBeNull();
+      // But raw data still exists (tombstone)
+      const raw = await jsonStore.readRaw("edges", key);
+      expect(raw).toMatchObject({
+        _deleted: true,
+        _table: "edges",
+        _key: key,
+      });
+    });
+  });
+
+  test("skips JSON writes when jsonStore is not provided", async () => {
+    await withEdges(async (edges, _db) => {
+      await edges.add({ caller: "0x1000", callee: "0x2000", kind: "direct_call" });
+      // Should not throw even though no jsonStore is provided
+      await edges.remove("0x1000", "0x2000");
     });
   });
 });

@@ -1,11 +1,14 @@
 import type { Database } from "bun:sqlite";
 import { randomUUID } from "node:crypto";
 import type { CreateJobInput, Job, JobStatus } from "../db/types.js";
+import type { JsonStore } from "../persistence/types.js";
 
 type JobRow = Job;
 
+const COMPLETED_STATUSES = ["done", "cancelled", "failed"] as const;
+
 export class JobsModule {
-  constructor(private readonly db: Database) {}
+  constructor(private readonly db: Database, private readonly jsonStore?: JsonStore) {}
 
   async create(input: CreateJobInput): Promise<Job> {
     const jobId = randomUUID();
@@ -31,6 +34,10 @@ export class JobsModule {
     const job = await this.get(jobId);
     if (!job) {
       throw new Error(`failed to create job ${jobId}`);
+    }
+
+    if (this.jsonStore && (COMPLETED_STATUSES as unknown as string[]).includes(job.status)) {
+      await this.jsonStore.write("jobs", job.job_id, job as unknown as Record<string, unknown>);
     }
 
     return job;
@@ -63,7 +70,13 @@ export class JobsModule {
       return this.findById(job.job_id);
     });
 
-    return claim(filter?.role ?? null);
+    const claimedJob = claim(filter?.role ?? null);
+
+    if (claimedJob && this.jsonStore) {
+      await this.jsonStore.delete("jobs", claimedJob.job_id);
+    }
+
+    return claimedJob;
   }
 
   async get(jobId: string): Promise<Job | null> {
@@ -71,12 +84,12 @@ export class JobsModule {
   }
 
   async complete(jobId: string, outputPath?: string): Promise<void> {
-    this.updateStatus(jobId, "done", { outputPath: outputPath ?? null });
+    await this.updateStatus(jobId, "done", { outputPath: outputPath ?? null });
   }
 
   async fail(jobId: string, error: string): Promise<void> {
     void error;
-    this.updateStatus(jobId, "failed");
+    await this.updateStatus(jobId, "failed");
   }
 
   async list(filter?: { status?: JobStatus; role?: string }): Promise<Job[]> {
@@ -94,14 +107,14 @@ export class JobsModule {
   }
 
   async cancel(jobId: string): Promise<void> {
-    this.updateStatus(jobId, "cancelled");
+    await this.updateStatus(jobId, "cancelled");
   }
 
   private findById(jobId: string): Job | null {
     return this.db.query("SELECT * FROM jobs WHERE job_id = $jobId;").get({ $jobId: jobId }) as JobRow | null;
   }
 
-  private updateStatus(jobId: string, status: JobStatus, options: { outputPath?: string | null } = {}): void {
+  private async updateStatus(jobId: string, status: JobStatus, options: { outputPath?: string | null } = {}): Promise<Job | null> {
     const now = new Date().toISOString();
 
     if (Object.hasOwn(options, "outputPath")) {
@@ -112,15 +125,28 @@ export class JobsModule {
            WHERE job_id = $jobId;`,
         )
         .run({ $jobId: jobId, $status: status, $outputPath: options.outputPath ?? null, $now: now });
-      return;
+    } else {
+      this.db
+        .query(
+          `UPDATE jobs
+           SET status = $status, updated_at = $now
+           WHERE job_id = $jobId;`,
+        )
+        .run({ $jobId: jobId, $status: status, $now: now });
     }
 
-    this.db
-      .query(
-        `UPDATE jobs
-         SET status = $status, updated_at = $now
-         WHERE job_id = $jobId;`,
-      )
-      .run({ $jobId: jobId, $status: status, $now: now });
+    const job = this.findById(jobId);
+
+    if (this.jsonStore) {
+      if ((COMPLETED_STATUSES as unknown as string[]).includes(status)) {
+        if (job) {
+          await this.jsonStore.write("jobs", jobId, job as unknown as Record<string, unknown>);
+        }
+      } else {
+        await this.jsonStore.delete("jobs", jobId);
+      }
+    }
+
+    return job;
   }
 }

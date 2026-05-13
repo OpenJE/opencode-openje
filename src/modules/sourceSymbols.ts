@@ -1,5 +1,6 @@
 import type { Database } from "bun:sqlite";
 import type { SourceSymbol, SourceSymbolKind, SourceSymbolStatus } from "../db/types.js";
+import type { JsonStore } from "../persistence/types.js";
 
 export type CreateSymbolInput = {
   symbolId: string;
@@ -29,7 +30,7 @@ const UPDATE_COLUMNS: readonly UpdatableColumn[] = [
 ] as const;
 
 export class SourceSymbolsModule {
-  constructor(private readonly db: Database) {}
+  constructor(private readonly db: Database, private readonly jsonStore?: JsonStore) {}
 
   async create(input: CreateSymbolInput): Promise<SourceSymbol> {
     this.db
@@ -69,6 +70,10 @@ export class SourceSymbolsModule {
       throw new Error(`Failed to create source symbol ${input.symbolId}`);
     }
 
+    if (this.jsonStore) {
+      await this.jsonStore.write("source_symbols", symbol.symbol_id, symbol as unknown as Record<string, unknown>);
+    }
+
     return symbol;
   }
 
@@ -105,6 +110,13 @@ export class SourceSymbolsModule {
     this.db
       .query("UPDATE source_symbols SET status = $status WHERE symbol_id = $symbolId;")
       .run({ $symbolId: symbolId, $status: status });
+
+    if (this.jsonStore) {
+      const symbol = await this.get(symbolId);
+      if (symbol) {
+        await this.jsonStore.write("source_symbols", symbolId, symbol as unknown as Record<string, unknown>);
+      }
+    }
   }
 
   async update(symbolId: string, updates: Partial<SourceSymbol>): Promise<void> {
@@ -127,9 +139,20 @@ export class SourceSymbolsModule {
     }
 
     this.db.query(`UPDATE source_symbols SET ${setClauses.join(", ")} WHERE symbol_id = $symbolId;`).run(params);
+
+    if (this.jsonStore) {
+      const symbol = await this.get(symbolId);
+      if (symbol) {
+        await this.jsonStore.write("source_symbols", symbolId, symbol as unknown as Record<string, unknown>);
+      }
+    }
   }
 
   async remove(symbolId: string): Promise<void> {
     this.db.query("DELETE FROM source_symbols WHERE symbol_id = $symbolId;").run({ $symbolId: symbolId });
+
+    if (this.jsonStore) {
+      await this.jsonStore.delete("source_symbols", symbolId);
+    }
   }
 }

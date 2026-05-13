@@ -11,8 +11,11 @@ devenv.local.yaml
 # pre-commit
 .pre-commit-config.yaml
 
-# Rework
-.rework/
+# Rework: track JSON files but not the database
+.rework/re.db
+.rework/re.db-wal
+.rework/re.db-shm
+.rework/packets/
 
 .opencode/
 opencode.jsonc

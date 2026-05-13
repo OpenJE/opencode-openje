@@ -13,7 +13,8 @@ export type FunctionStatus =
   | "failed"
   | "skipped"
   | "cycle_member"
-  | "stale";
+  | "stale"
+  | "removed";
 
 export type EdgeKind =
   | "direct_call"
@@ -75,6 +76,8 @@ export interface AnalysisFunction {
   dirty: SqliteBoolean;
   last_pseudocode_hash: string | null;
   updated_at: string | null;
+  removed_at: string | null;
+  removal_reason: string | null;
 }
 
 export interface AnalysisEdge {
@@ -127,6 +130,7 @@ export interface Review {
   accepted_contract_json: string;
   accepted_contract_path: string | null;
   rejected_claims_json: string | null;
+  amend_reason: string | null;
   created_at: string | null;
 }
 

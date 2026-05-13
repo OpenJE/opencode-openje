@@ -124,7 +124,7 @@ Add to `opencode.jsonc`:
 
 ### Plugin Return Format
 
-All 13 tools use the official `@opencode-ai/plugin` SDK's `tool()` helper with Zod-validated schemas. Tools return `ToolResult` format: `string | { output: string; metadata?: Record<string, any> }`.
+All 20 tools use the official `@opencode-ai/plugin` SDK's `tool()` helper with Zod-validated schemas. Tools return `ToolResult` format: `string | { output: string; metadata?: Record<string, any> }`.
 
 - **Success**: `{ output: "<json-stringified data>" }` or plain string
 - **Error**: `{ output: "{\"error\":{\"message\":\"...\",\"code\":\"...\"}}" }`
@@ -493,15 +493,22 @@ traversalPlan(rootEa: string, edges: AnalysisEdge[], functions: Map<string, Anal
 | Tool | Description |
 |------|-------------|
 | `re_status` | Show overall ledger status (counts of functions, edges, jobs, worker runs, reviews, stale functions, source symbols, source blocks) |
-| `re_function_register` | Register a function with EA, optional status and pseudocode hash |
-| `re_function_get` | Get a function by its effective address |
-| `re_function_set_status` | Update a function's status |
+| `re_function_register` | Register a function in the ledger |
+| `re_function_unregister` | Unregister a function from the ledger |
+| `re_function_get` | Get a function by EA |
+| `re_function_set_status` | Set function status |
 | `re_function_list` | List all functions, optionally filtered by status |
-| `re_edge_add` | Add a call edge between two functions (caller -> callee) |
-| `re_job_create` | Create a new job with type, target, and optional role |
+| `re_edge_add` | Add a call edge between functions |
+| `re_edge_remove` | Remove an edge between functions |
+| `re_job_create` | Create a job |
 | `re_job_next` | Claim the next available job (atomic), optionally filtered by role |
-| `re_worker_submit` | Submit worker run output for a function (Zod-validated) |
-| `re_review_submit` | Submit an accepted review contract (increments summary_version) |
+| `re_job_cancel` | Cancel a job |
+| `re_worker_submit` | Submit a worker run with structured analysis output |
+| `re_worker_run_update` | Update a worker run with new analysis output |
+| `re_review_submit` | Submit an accepted review contract |
+| `re_review_amend` | Amend an existing review contract |
+| `re_review_list` | List all reviews for a function |
+| `re_review_get` | Get a review by ID |
 | `re_stale_mark_parents` | Mark parent functions stale after child's summary changes |
 | `re_stale_list` | List all functions currently in stale state |
 | `re_tree` | Get recursive status tree starting from a root function EA |

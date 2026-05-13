@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
 import { runMigrations } from "../db/migrations.js";
 import { SourceSymbolsModule } from "./sourceSymbols.js";
+import { InMemoryJsonStore } from "../persistence/JsonStore.js";
 
 describe("SourceSymbolsModule", () => {
   let db: Database;
@@ -16,6 +17,18 @@ describe("SourceSymbolsModule", () => {
   afterEach(() => {
     db.close();
   });
+
+  async function withJsonStore(testBody: (mod: SourceSymbolsModule, jsonStore: InMemoryJsonStore) => Promise<void>): Promise<void> {
+    const db = new Database(":memory:");
+    runMigrations(db);
+    const jsonStore = new InMemoryJsonStore();
+
+    try {
+      await testBody(new SourceSymbolsModule(db, jsonStore), jsonStore);
+    } finally {
+      db.close();
+    }
+  }
 
   test("create and get source symbol", async () => {
     const created = await mod.create({
@@ -134,5 +147,56 @@ describe("SourceSymbolsModule", () => {
     await mod.remove("sym_main");
 
     await expect(mod.get("sym_main")).resolves.toBeNull();
+  });
+
+  test("create writes to json store", async () => {
+    await withJsonStore(async (mod, jsonStore) => {
+      await mod.create({
+        symbolId: "sym_json",
+        kind: "function",
+        name: "testFunc",
+        namespace: "test",
+      });
+
+      const data = await jsonStore.read("source_symbols", "sym_json");
+      expect(data).not.toBeNull();
+      expect(data).toMatchObject({
+        symbol_id: "sym_json",
+        kind: "function",
+        name: "testFunc",
+        namespace: "test",
+        status: "unplaced",
+      });
+    });
+  });
+
+  test("updateStatus writes to json store", async () => {
+    await withJsonStore(async (mod, jsonStore) => {
+      await mod.create({ symbolId: "sym_status", kind: "function", name: "func" });
+      await mod.updateStatus("sym_status", "emitted");
+
+      const data = await jsonStore.read("source_symbols", "sym_status");
+      expect(data).toMatchObject({
+        symbol_id: "sym_status",
+        status: "emitted",
+      });
+    });
+  });
+
+  test("remove writes tombstone to json store", async () => {
+    await withJsonStore(async (mod, jsonStore) => {
+      await mod.create({ symbolId: "sym_tombstone", kind: "function", name: "func" });
+      await mod.remove("sym_tombstone");
+
+      const data = await jsonStore.read("source_symbols", "sym_tombstone");
+      expect(data).toBeNull();
+
+      const raw = await jsonStore.readRaw("source_symbols", "sym_tombstone");
+      expect(raw).toMatchObject({
+        _deleted: true,
+        _table: "source_symbols",
+        _key: "sym_tombstone",
+      });
+    });
   });
 });

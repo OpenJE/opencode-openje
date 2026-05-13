@@ -147,3 +147,12 @@ export const V1_TABLE_STATEMENTS = [
   CREATE_SOURCE_BLOCKS_TABLE_SQL,
   CREATE_SIMPLIFICATIONS_TABLE_SQL,
 ] as const;
+
+export const ALTER_ANALYSIS_FUNCTIONS_ADD_REMOVAL_COLUMNS_SQL = `
+ALTER TABLE analysis_functions ADD COLUMN removed_at TEXT;
+ALTER TABLE analysis_functions ADD COLUMN removal_reason TEXT;
+`;
+
+export const ALTER_REVIEWS_ADD_AMEND_REASON_SQL = `
+ALTER TABLE reviews ADD COLUMN amend_reason TEXT;
+`;

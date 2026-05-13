@@ -77,6 +77,29 @@ export const OpenJePlugin: Plugin = async ({ client, directory, worktree }) => {
         },
       }),
 
+      re_function_unregister: tool({
+        description: "Unregister a function from the ledger",
+        args: {
+          ea: tool.schema.string().describe("Function effective address"),
+          reason: tool.schema.string().describe("Reason for unregistering"),
+        },
+        async execute(args, _ctx: ToolContext) {
+          try {
+            await re.functions.unregister(args.ea, args.reason);
+            return jsonResult({ unregistered: args.ea, reason: args.reason });
+          } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            if (msg.includes("not found")) {
+              return errorResult(msg, "NOT_FOUND");
+            }
+            if (msg.includes("Cannot unregister")) {
+              return errorResult(msg, "DEPENDENCY_ERROR");
+            }
+            throw err;
+          }
+        },
+      }),
+
       re_function_set_status: tool({
         description: "Set function status",
         args: {
@@ -123,6 +146,23 @@ export const OpenJePlugin: Plugin = async ({ client, directory, worktree }) => {
         },
       }),
 
+      re_edge_remove: tool({
+        description: "Remove an edge between functions",
+        args: {
+          caller: tool.schema.string().describe("Caller EA"),
+          callee: tool.schema.string().describe("Callee EA"),
+          reason: tool.schema.string().describe("Reason for removal"),
+        },
+        async execute(args, _ctx: ToolContext) {
+          try {
+            await re.edges.remove(args.caller, args.callee);
+            return jsonResult({ removed: `${args.caller} -> ${args.callee}` });
+          } catch (err) {
+            return errorResult((err as Error).message, "NOT_FOUND");
+          }
+        },
+      }),
+
       re_job_create: tool({
         description: "Create a job",
         args: {
@@ -154,13 +194,50 @@ export const OpenJePlugin: Plugin = async ({ client, directory, worktree }) => {
         },
       }),
 
+      re_job_cancel: tool({
+        description: "Cancel a job",
+        args: {
+          job_id: tool.schema.string().describe("Job ID to cancel"),
+          reason: tool.schema.string().describe("Reason for cancellation"),
+        },
+        async execute(args, _ctx: ToolContext) {
+          try {
+            await re.jobs.cancel(args.job_id);
+            return jsonResult({ cancelled: args.job_id });
+          } catch (err) {
+            return errorResult(`Job ${args.job_id} not found`, "NOT_FOUND");
+          }
+        },
+      }),
+
       re_worker_submit: tool({
-        description: "Submit worker run output",
+        description: "Submit a worker run with structured analysis output",
         args: {
           function_ea: tool.schema.string().describe("Function EA"),
           role: tool.schema.string().describe("Worker role"),
           model: tool.schema.string().describe("Model name"),
-          output: tool.schema.string().describe('Worker analysis as JSON. Required: {"purpose":{"summary":"...","confidence":0.85,"evidence":["..."]}}. Optional: inputs[], return_value, side_effects[], uncertainties[]'),
+          output: tool.schema.object({
+            purpose: tool.schema.object({
+              summary: tool.schema.string().describe("What this function does"),
+              confidence: tool.schema.number().min(0).max(1).describe("Confidence 0-1"),
+              evidence: tool.schema.array(tool.schema.string()).describe("Supporting evidence"),
+            }).describe("Function purpose"),
+            inputs: tool.schema.array(tool.schema.object({
+              original: tool.schema.string().describe("Original parameter name"),
+              proposed_name: tool.schema.string().optional().describe("Suggested parameter name"),
+              type: tool.schema.string().optional().describe("Parameter type"),
+              confidence: tool.schema.number().min(0).max(1).optional().describe("Confidence 0-1"),
+              evidence: tool.schema.array(tool.schema.string()).optional().describe("Supporting evidence"),
+            })).default([]).describe("Function inputs"),
+            return_value: tool.schema.object({
+              type: tool.schema.string().optional().describe("Return type"),
+              meaning: tool.schema.string().optional().describe("Return value meaning"),
+              confidence: tool.schema.number().min(0).max(1).optional().describe("Confidence 0-1"),
+              evidence: tool.schema.array(tool.schema.string()).optional().describe("Supporting evidence"),
+            }).optional().describe("Return value analysis"),
+            side_effects: tool.schema.array(tool.schema.unknown()).default([]).describe("Side effects"),
+            uncertainties: tool.schema.array(tool.schema.string()).default([]).describe("Uncertainties"),
+          }).describe("Worker analysis output"),
           job_id: tool.schema.string().describe("Job ID").optional(),
         },
         async execute(args, _ctx: ToolContext) {
@@ -169,28 +246,184 @@ export const OpenJePlugin: Plugin = async ({ client, directory, worktree }) => {
             functionEa: args.function_ea,
             role: args.role,
             model: args.model,
-            output: JSON.parse(args.output),
+            output: args.output,
           });
           return jsonResult({ id });
         },
       }),
 
+      re_worker_run_update: tool({
+        description: "Update a worker run with new analysis output",
+        args: {
+          id: tool.schema.number().describe("Worker run ID"),
+          output: tool.schema.object({
+            purpose: tool.schema.object({
+              summary: tool.schema.string().describe("What this function does"),
+              confidence: tool.schema.number().min(0).max(1).describe("Confidence 0-1"),
+              evidence: tool.schema.array(tool.schema.string()).describe("Supporting evidence"),
+            }).describe("Function purpose"),
+            inputs: tool.schema.array(tool.schema.object({
+              original: tool.schema.string().describe("Original parameter name"),
+              proposed_name: tool.schema.string().optional().describe("Suggested parameter name"),
+              type: tool.schema.string().optional().describe("Parameter type"),
+              confidence: tool.schema.number().min(0).max(1).optional().describe("Confidence 0-1"),
+              evidence: tool.schema.array(tool.schema.string()).optional().describe("Supporting evidence"),
+            })).default([]).describe("Function inputs"),
+            return_value: tool.schema.object({
+              type: tool.schema.string().optional().describe("Return type"),
+              meaning: tool.schema.string().optional().describe("Return value meaning"),
+              confidence: tool.schema.number().min(0).max(1).optional().describe("Confidence 0-1"),
+              evidence: tool.schema.array(tool.schema.string()).optional().describe("Supporting evidence"),
+            }).optional().describe("Return value analysis"),
+            side_effects: tool.schema.array(tool.schema.unknown()).default([]).describe("Side effects"),
+            uncertainties: tool.schema.array(tool.schema.string()).default([]).describe("Uncertainties"),
+          }).describe("Worker analysis output"),
+          reason: tool.schema.string().describe("Reason for the update"),
+        },
+        async execute(args, _ctx: ToolContext) {
+          try {
+            const existing = await re.workers.get(args.id);
+            if (existing === null) {
+              return errorResult(`Worker run ${args.id} not found`, "NOT_FOUND");
+            }
+            await re.workers.update(args.id, args.output);
+            const functionEa = existing.function_ea;
+            const latestReview = await re.reviews.latest(functionEa);
+            if (latestReview !== null) {
+              return jsonResult({
+                updated: args.id,
+                reason: args.reason,
+                warning: `Function ${functionEa} has reviews — consider re-reviewing after this update`,
+              });
+            }
+            return jsonResult({ updated: args.id, reason: args.reason });
+          } catch (err) {
+            const message = err instanceof Error ? err.message : String(err);
+            return errorResult(message, "VALIDATION_ERROR");
+          }
+        },
+      }),
+
       re_review_submit: tool({
-        description: "Submit a review contract",
+        description: "Submit a review contract with structured fields",
         args: {
           function_ea: tool.schema.string().describe("Function EA"),
           reviewer_model: tool.schema.string().describe("Reviewer model"),
-          contract: tool.schema.string().describe('Accepted contract as JSON. Required: {"accepted_name":"...","kind":"function","purpose":"...","confidence":0.9}. Kind: function|method|constructor|destructor|thunk|unknown. Optional: accepted_prototype, owner, return_value, accepted_variable_names, dependencies_used, rejected_claims'),
-          rejected_claims: tool.schema.string().describe("Rejected claims as JSON string array").optional(),
+          contract: tool.schema.object({
+            contract_version: tool.schema.number().int().nonnegative().optional().describe("Contract version"),
+            accepted_name: tool.schema.string().describe("Accepted function name"),
+            accepted_prototype: tool.schema.string().optional().describe("Function prototype/signature"),
+            kind: tool.schema.enum(["function", "method", "constructor", "destructor", "thunk", "unknown"]).describe("Function kind"),
+            owner: tool.schema.string().optional().describe("Class/struct owner"),
+            purpose: tool.schema.string().describe("Function purpose description"),
+            return_value: tool.schema.object({
+              type: tool.schema.string().optional().describe("Return type"),
+              meaning: tool.schema.string().optional().describe("Return value meaning"),
+            }).optional().describe("Return value"),
+            accepted_variable_names: tool.schema.record(tool.schema.string(), tool.schema.string()).default({}).describe("Variable name mappings"),
+            dependencies_used: tool.schema.array(tool.schema.object({
+              ea: tool.schema.string().describe("Dependency EA"),
+              summary_version: tool.schema.number().int().nonnegative().describe("Summary version used"),
+            })).default([]).describe("Dependencies used"),
+            confidence: tool.schema.number().min(0).max(1).describe("Confidence 0-1"),
+          }).describe("Accepted review contract (function_ea is auto-filled from top-level parameter)"),
+          rejected_claims: tool.schema.array(tool.schema.object({
+            claim: tool.schema.string().describe("Claim description"),
+            reason: tool.schema.string().describe("Reason for rejection"),
+          })).describe("Rejected claims").optional(),
         },
         async execute(args, _ctx: ToolContext) {
-          await re.reviews.submit({
+          const result = await re.reviews.submit({
             functionEa: args.function_ea,
             reviewerModel: args.reviewer_model,
-            acceptedContract: JSON.parse(args.contract),
-            rejectedClaims: args.rejected_claims ? JSON.parse(args.rejected_claims) : undefined,
+            acceptedContract: { ...args.contract, function_ea: args.function_ea },
+            rejectedClaims: args.rejected_claims,
           });
-          return jsonResult({ reviewed: args.function_ea });
+          return jsonResult({ reviewed: args.function_ea, review_id: result.id });
+        },
+      }),
+
+      re_review_amend: tool({
+        description: "Amend an existing review contract",
+        args: {
+          review_id: tool.schema.number().int().nonnegative().describe("Review ID to amend"),
+          contract: tool.schema.object({
+            contract_version: tool.schema.number().int().nonnegative().optional().describe("Contract version"),
+            accepted_name: tool.schema.string().describe("Accepted function name"),
+            accepted_prototype: tool.schema.string().optional().describe("Function prototype/signature"),
+            kind: tool.schema.enum(["function", "method", "constructor", "destructor", "thunk", "unknown"]).describe("Function kind"),
+            owner: tool.schema.string().optional().describe("Class/struct owner"),
+            purpose: tool.schema.string().describe("Function purpose description"),
+            return_value: tool.schema.object({
+              type: tool.schema.string().optional().describe("Return type"),
+              meaning: tool.schema.string().optional().describe("Return value meaning"),
+            }).optional().describe("Return value"),
+            accepted_variable_names: tool.schema.record(tool.schema.string(), tool.schema.string()).default({}).describe("Variable name mappings"),
+            dependencies_used: tool.schema.array(tool.schema.object({
+              ea: tool.schema.string().describe("Dependency EA"),
+              summary_version: tool.schema.number().int().nonnegative().describe("Summary version used"),
+            })).default([]).describe("Dependencies used"),
+            confidence: tool.schema.number().min(0).max(1).describe("Confidence 0-1"),
+          }).describe("Amended accepted contract").optional(),
+          rejected_claims: tool.schema.array(tool.schema.object({
+            claim: tool.schema.string().describe("Claim description"),
+            reason: tool.schema.string().describe("Reason for rejection"),
+          })).describe("Rejected claims").optional(),
+          reason: tool.schema.string().describe("Reason for amendment"),
+        },
+        async execute(args, _ctx: ToolContext) {
+          if (args.contract === undefined && args.rejected_claims === undefined) {
+            return errorResult("Either contract or rejected_claims must be provided", "BAD_REQUEST");
+          }
+
+          let acceptedContract: unknown = args.contract;
+          if (args.contract !== undefined) {
+            const existingReview = await re.reviews.get(args.review_id);
+            if (existingReview === null) {
+              return errorResult(`Review ${args.review_id} not found`, "NOT_FOUND");
+            }
+            acceptedContract = { ...args.contract, function_ea: existingReview.function_ea };
+          }
+
+          try {
+            await re.reviews.amend({
+              reviewId: args.review_id,
+              acceptedContract,
+              rejectedClaims: args.rejected_claims,
+              reason: args.reason,
+            });
+            return jsonResult({ amended: args.review_id, reason: args.reason });
+          } catch (err) {
+            if (err instanceof Error && err.message.includes("not found")) {
+              return errorResult(`Review ${args.review_id} not found`, "NOT_FOUND");
+            }
+            throw err;
+          }
+        },
+      }),
+
+      re_review_list: tool({
+        description: "List all reviews for a function",
+        args: {
+          function_ea: tool.schema.string().describe("Function EA"),
+        },
+        async execute(args, _ctx: ToolContext) {
+          const reviews = await re.reviews.list(args.function_ea);
+          return jsonResult(reviews);
+        },
+      }),
+
+      re_review_get: tool({
+        description: "Get a review by ID",
+        args: {
+          review_id: tool.schema.number().int().nonnegative().describe("Review ID"),
+        },
+        async execute(args, _ctx: ToolContext) {
+          const review = await re.reviews.get(args.review_id);
+          if (!review) {
+            return errorResult(`Review ${args.review_id} not found`, "NOT_FOUND");
+          }
+          return jsonResult(review);
         },
       }),
 

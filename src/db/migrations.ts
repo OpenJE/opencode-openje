@@ -1,5 +1,10 @@
 import type { Database } from "bun:sqlite";
-import { CREATE_META_TABLE_SQL, V1_TABLE_STATEMENTS } from "./schema.js";
+import {
+  CREATE_META_TABLE_SQL,
+  V1_TABLE_STATEMENTS,
+  ALTER_ANALYSIS_FUNCTIONS_ADD_REMOVAL_COLUMNS_SQL,
+  ALTER_REVIEWS_ADD_AMEND_REASON_SQL,
+} from "./schema.js";
 
 export interface Migration {
   version: number;
@@ -10,6 +15,13 @@ export const MIGRATIONS: readonly Migration[] = [
   {
     version: 1,
     up: V1_TABLE_STATEMENTS.join("\n"),
+  },
+  {
+    version: 2,
+    up: [ALTER_ANALYSIS_FUNCTIONS_ADD_REMOVAL_COLUMNS_SQL, ALTER_REVIEWS_ADD_AMEND_REASON_SQL]
+      .map((sql) => sql.trim())
+      .filter(Boolean)
+      .join("\n"),
   },
 ] as const;
 

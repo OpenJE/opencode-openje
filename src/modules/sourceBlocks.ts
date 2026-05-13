@@ -1,5 +1,6 @@
 import type { Database } from "bun:sqlite";
 import type { SourceBlock } from "../db/types.js";
+import type { JsonStore } from "../persistence/types.js";
 
 export interface CreateBlockInput {
   blockId: string;
@@ -10,7 +11,7 @@ export interface CreateBlockInput {
 }
 
 export class SourceBlocksModule {
-  constructor(private readonly db: Database) {}
+  constructor(private readonly db: Database, private readonly jsonStore?: JsonStore) {}
 
   async create(input: CreateBlockInput): Promise<SourceBlock> {
     this.db
@@ -32,6 +33,11 @@ export class SourceBlocksModule {
 
     const block = await this.get(input.blockId);
     if (!block) throw new Error("Failed to create source block");
+
+    if (this.jsonStore) {
+      await this.jsonStore.write("source_blocks", block.block_id, block as unknown as Record<string, unknown>);
+    }
+
     return block;
   }
 
@@ -78,6 +84,13 @@ export class SourceBlocksModule {
     this.db
       .query(`UPDATE source_blocks SET ${fields.join(", ")} WHERE block_id = $blockId;`)
       .run(params as Record<string, string | number | null>);
+
+    if (this.jsonStore) {
+      const block = await this.get(blockId);
+      if (block) {
+        await this.jsonStore.write("source_blocks", blockId, block as unknown as Record<string, unknown>);
+      }
+    }
   }
 
   async listManualOverrides(): Promise<SourceBlock[]> {
@@ -90,5 +103,9 @@ export class SourceBlocksModule {
     this.db
       .query("DELETE FROM source_blocks WHERE block_id = $blockId;")
       .run({ $blockId: blockId });
+
+    if (this.jsonStore) {
+      await this.jsonStore.delete("source_blocks", blockId);
+    }
   }
 }

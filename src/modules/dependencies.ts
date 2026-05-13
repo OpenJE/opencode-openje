@@ -1,8 +1,10 @@
 import type { Database } from "bun:sqlite";
 import type { SummaryDependency } from "../db/types.js";
+import type { JsonStore } from "../persistence/types.js";
+import { summaryDependencyKey } from "../persistence/types.js";
 
 export class DependenciesModule {
-  constructor(private readonly db: Database) {}
+  constructor(private readonly db: Database, private readonly jsonStore?: JsonStore) {}
 
   async record(parentEa: string, childEa: string, childVersion: number): Promise<void> {
     this.db
@@ -17,6 +19,12 @@ export class DependenciesModule {
         $childEa: childEa,
         $childVersion: childVersion,
       });
+
+    if (this.jsonStore) {
+      const key = summaryDependencyKey(parentEa, childEa);
+      const data = { parent_ea: parentEa, child_ea: childEa, child_summary_version_used: childVersion };
+      await this.jsonStore.write("dependencies", key, data);
+    }
   }
 
   async usedByParent(parentEa: string): Promise<SummaryDependency[]> {
@@ -50,5 +58,10 @@ export class DependenciesModule {
     this.db
       .query("DELETE FROM summary_dependencies WHERE parent_ea = $parentEa AND child_ea = $childEa;")
       .run({ $parentEa: parentEa, $childEa: childEa });
+
+    if (this.jsonStore) {
+      const key = summaryDependencyKey(parentEa, childEa);
+      await this.jsonStore.delete("dependencies", key);
+    }
   }
 }

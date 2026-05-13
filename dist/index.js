@@ -216,12 +216,24 @@ var V1_TABLE_STATEMENTS = [
   CREATE_SOURCE_BLOCKS_TABLE_SQL,
   CREATE_SIMPLIFICATIONS_TABLE_SQL
 ];
+var ALTER_ANALYSIS_FUNCTIONS_ADD_REMOVAL_COLUMNS_SQL = `
+ALTER TABLE analysis_functions ADD COLUMN removed_at TEXT;
+ALTER TABLE analysis_functions ADD COLUMN removal_reason TEXT;
+`;
+var ALTER_REVIEWS_ADD_AMEND_REASON_SQL = `
+ALTER TABLE reviews ADD COLUMN amend_reason TEXT;
+`;
 
 // src/db/migrations.ts
 var MIGRATIONS = [
   {
     version: 1,
     up: V1_TABLE_STATEMENTS.join(`
+`)
+  },
+  {
+    version: 2,
+    up: [ALTER_ANALYSIS_FUNCTIONS_ADD_REMOVAL_COLUMNS_SQL, ALTER_REVIEWS_ADD_AMEND_REASON_SQL].map((sql) => sql.trim()).filter(Boolean).join(`
 `)
   }
 ];
@@ -286,11 +298,87 @@ class ArtifactsModule {
   }
 }
 
+// src/persistence/types.ts
+function sanitizeEaForFilename(ea) {
+  return ea.replaceAll(/[/:]/g, "_");
+}
+function analysisEdgeKey(callerEa, calleeEa) {
+  return `${sanitizeEaForFilename(callerEa)}__${sanitizeEaForFilename(calleeEa)}`;
+}
+function summaryDependencyKey(parentEa, childEa) {
+  return `${sanitizeEaForFilename(parentEa)}__${sanitizeEaForFilename(childEa)}`;
+}
+function workerRunKey(functionEa, role, id) {
+  return `${sanitizeEaForFilename(functionEa)}__${sanitizeSegment(role)}__${id}`;
+}
+function reviewKey(functionEa, contractVersion) {
+  return `${sanitizeEaForFilename(functionEa)}__v${contractVersion}`;
+}
+function simplificationKey(symbolId, id) {
+  return `${sanitizeSegment(symbolId)}__${id}`;
+}
+function sanitizeSegment(value) {
+  return value.replaceAll(/[/:]/g, "_");
+}
+function field(record, name) {
+  if (record === null || typeof record !== "object" || !(name in record)) {
+    throw new TypeError(`record is missing required field ${name}`);
+  }
+  const value = record[name];
+  if (typeof value !== "string" && typeof value !== "number") {
+    throw new TypeError(`record field ${name} must be a string or number`);
+  }
+  return value;
+}
+function stringField(record, name) {
+  return String(field(record, name));
+}
+var TABLE_CONFIGS = {
+  analysis_functions: {
+    tableDir: "analysis_functions",
+    primaryKey: (record) => sanitizeEaForFilename(stringField(record, "ea"))
+  },
+  analysis_edges: {
+    tableDir: "analysis_edges",
+    primaryKey: (record) => analysisEdgeKey(stringField(record, "caller_ea"), stringField(record, "callee_ea"))
+  },
+  jobs: {
+    tableDir: "jobs",
+    primaryKey: (record) => sanitizeSegment(stringField(record, "job_id"))
+  },
+  worker_runs: {
+    tableDir: "worker_runs",
+    primaryKey: (record) => workerRunKey(stringField(record, "function_ea"), stringField(record, "role"), field(record, "id"))
+  },
+  reviews: {
+    tableDir: "reviews",
+    primaryKey: (record) => reviewKey(stringField(record, "function_ea"), field(record, "contract_version"))
+  },
+  summary_dependencies: {
+    tableDir: "summary_dependencies",
+    primaryKey: (record) => summaryDependencyKey(stringField(record, "parent_ea"), stringField(record, "child_ea"))
+  },
+  source_symbols: {
+    tableDir: "source_symbols",
+    primaryKey: (record) => sanitizeSegment(stringField(record, "symbol_id"))
+  },
+  source_blocks: {
+    tableDir: "source_blocks",
+    primaryKey: (record) => sanitizeSegment(stringField(record, "block_id"))
+  },
+  simplifications: {
+    tableDir: "simplifications",
+    primaryKey: (record) => simplificationKey(stringField(record, "symbol_id"), field(record, "id"))
+  }
+};
+
 // src/modules/dependencies.ts
 class DependenciesModule {
   db;
-  constructor(db) {
+  jsonStore;
+  constructor(db, jsonStore) {
     this.db = db;
+    this.jsonStore = jsonStore;
   }
   async record(parentEa, childEa, childVersion) {
     this.db.query(`INSERT INTO summary_dependencies (parent_ea, child_ea, child_summary_version_used)
@@ -301,6 +389,11 @@ class DependenciesModule {
       $childEa: childEa,
       $childVersion: childVersion
     });
+    if (this.jsonStore) {
+      const key = summaryDependencyKey(parentEa, childEa);
+      const data = { parent_ea: parentEa, child_ea: childEa, child_summary_version_used: childVersion };
+      await this.jsonStore.write("dependencies", key, data);
+    }
   }
   async usedByParent(parentEa) {
     return this.db.query("SELECT * FROM summary_dependencies WHERE parent_ea = $parentEa;").all({ $parentEa: parentEa });
@@ -318,16 +411,23 @@ class DependenciesModule {
   }
   async remove(parentEa, childEa) {
     this.db.query("DELETE FROM summary_dependencies WHERE parent_ea = $parentEa AND child_ea = $childEa;").run({ $parentEa: parentEa, $childEa: childEa });
+    if (this.jsonStore) {
+      const key = summaryDependencyKey(parentEa, childEa);
+      await this.jsonStore.delete("dependencies", key);
+    }
   }
 }
 
 // src/modules/edges.ts
 class EdgesModule {
   db;
-  constructor(db) {
+  jsonStore;
+  constructor(db, jsonStore) {
     this.db = db;
+    this.jsonStore = jsonStore;
   }
   async add(input) {
+    const discoveredAt = new Date().toISOString();
     this.db.query(`INSERT INTO analysis_edges (caller_ea, callee_ea, edge_kind, blocking, reason, discovered_at)
          VALUES ($caller, $callee, $kind, $blocking, $reason, $discoveredAt)
          ON CONFLICT(caller_ea, callee_ea) DO UPDATE SET
@@ -340,8 +440,20 @@ class EdgesModule {
       $kind: input.kind,
       $blocking: input.blocking === false ? 0 : 1,
       $reason: input.reason ?? null,
-      $discoveredAt: new Date().toISOString()
+      $discoveredAt: discoveredAt
     });
+    if (this.jsonStore) {
+      const key = analysisEdgeKey(input.caller, input.callee);
+      const data = {
+        caller_ea: input.caller,
+        callee_ea: input.callee,
+        edge_kind: input.kind,
+        blocking: input.blocking === false ? 0 : 1,
+        reason: input.reason ?? null,
+        discovered_at: discoveredAt
+      };
+      await this.jsonStore.write("edges", key, data);
+    }
   }
   async children(caller) {
     return this.db.query(`SELECT caller_ea, callee_ea, edge_kind, blocking, reason, discovered_at
@@ -369,54 +481,112 @@ class EdgesModule {
   async remove(caller, callee) {
     this.db.query(`DELETE FROM analysis_edges
          WHERE caller_ea = $caller AND callee_ea = $callee;`).run({ $caller: caller, $callee: callee });
+    if (this.jsonStore) {
+      const key = analysisEdgeKey(caller, callee);
+      await this.jsonStore.delete("edges", key);
+    }
   }
 }
 
 // src/modules/functions.ts
 class FunctionsModule {
   db;
-  constructor(db) {
+  jsonStore;
+  constructor(db, jsonStore) {
     this.db = db;
+    this.jsonStore = jsonStore;
   }
   async register(input) {
-    this.db.query(`INSERT OR REPLACE INTO analysis_functions (
-           ea,
-           status,
-           last_pseudocode_hash,
-           updated_at
-         ) VALUES (
-           $ea,
-           $status,
-           $lastPseudocodeHash,
-           $updatedAt
-         );`).run({
+    const updatedAt = new Date().toISOString();
+    this.db.query(`INSERT INTO analysis_functions (ea, status, last_pseudocode_hash, updated_at)
+         VALUES ($ea, $status, $lastPseudocodeHash, $updatedAt)
+         ON CONFLICT(ea) DO UPDATE SET
+           status = excluded.status,
+           last_pseudocode_hash = excluded.last_pseudocode_hash,
+           updated_at = excluded.updated_at,
+           removed_at = NULL,
+           removal_reason = NULL;`).run({
       $ea: input.ea,
       $status: input.status ?? "unknown",
       $lastPseudocodeHash: input.lastPseudocodeHash ?? null,
-      $updatedAt: new Date().toISOString()
+      $updatedAt: updatedAt
     });
+    if (this.jsonStore) {
+      const fn = await this.get(input.ea);
+      if (fn) {
+        await this.jsonStore.write("functions", input.ea, fn);
+      }
+    }
   }
   async get(ea) {
     return this.db.query("SELECT * FROM analysis_functions WHERE ea = $ea;").get({ $ea: ea });
   }
   async setStatus(ea, status) {
+    const updatedAt = new Date().toISOString();
     this.db.query(`UPDATE analysis_functions
          SET status = $status,
              updated_at = $updatedAt
          WHERE ea = $ea;`).run({
       $ea: ea,
       $status: status,
-      $updatedAt: new Date().toISOString()
+      $updatedAt: updatedAt
     });
+    if (this.jsonStore) {
+      const fn = await this.get(ea);
+      if (fn) {
+        await this.jsonStore.write("functions", ea, fn);
+      }
+    }
   }
   async markDirty(ea, reason) {
+    const updatedAt = new Date().toISOString();
     this.db.query(`UPDATE analysis_functions
          SET dirty = 1,
              updated_at = $updatedAt
          WHERE ea = $ea;`).run({
       $ea: ea,
-      $updatedAt: new Date().toISOString()
+      $updatedAt: updatedAt
     });
+    if (this.jsonStore) {
+      const fn = await this.get(ea);
+      if (fn) {
+        await this.jsonStore.write("functions", ea, fn);
+      }
+    }
+  }
+  async unregister(ea, reason) {
+    const tx = this.db.transaction(() => {
+      const fn = this.db.query("SELECT ea FROM analysis_functions WHERE ea = $ea;").get({ $ea: ea });
+      if (!fn) {
+        throw new Error(`Function ${ea} not found`);
+      }
+      const edgeCount = this.db.query("SELECT COUNT(*) AS cnt FROM analysis_edges WHERE caller_ea = $ea OR callee_ea = $ea;").get({ $ea: ea }).cnt;
+      const activeJobCount = this.db.query("SELECT COUNT(*) AS cnt FROM jobs WHERE target = $ea AND status NOT IN ('done', 'failed', 'cancelled');").get({ $ea: ea }).cnt;
+      const workerRunCount = this.db.query("SELECT COUNT(*) AS cnt FROM worker_runs WHERE function_ea = $ea;").get({ $ea: ea }).cnt;
+      const reviewCount = this.db.query("SELECT COUNT(*) AS cnt FROM reviews WHERE function_ea = $ea;").get({ $ea: ea }).cnt;
+      const dependencyCount = this.db.query("SELECT COUNT(*) AS cnt FROM summary_dependencies WHERE parent_ea = $ea OR child_ea = $ea;").get({ $ea: ea }).cnt;
+      if (edgeCount > 0 || activeJobCount > 0 || workerRunCount > 0 || reviewCount > 0 || dependencyCount > 0) {
+        throw new Error(`Cannot unregister ${ea}: has ${edgeCount} edges, ${activeJobCount} active jobs, ${workerRunCount} worker_runs, ${reviewCount} reviews, ${dependencyCount} dependencies. Remove dependents first.`);
+      }
+      const now = new Date().toISOString();
+      this.db.query(`UPDATE analysis_functions
+           SET status = 'removed',
+               removed_at = $now,
+               removal_reason = $reason,
+               updated_at = $now
+           WHERE ea = $ea;`).run({
+        $ea: ea,
+        $now: now,
+        $reason: reason
+      });
+    });
+    tx();
+    if (this.jsonStore) {
+      const fn = await this.get(ea);
+      if (fn) {
+        await this.jsonStore.write("functions", ea, fn);
+      }
+    }
   }
   async listByStatus(status) {
     return this.db.query("SELECT * FROM analysis_functions WHERE status = $status ORDER BY ea;").all({ $status: status });
@@ -431,11 +601,14 @@ class FunctionsModule {
 
 // src/modules/jobs.ts
 import { randomUUID } from "crypto";
+var COMPLETED_STATUSES = ["done", "cancelled", "failed"];
 
 class JobsModule {
   db;
-  constructor(db) {
+  jsonStore;
+  constructor(db, jsonStore) {
     this.db = db;
+    this.jsonStore = jsonStore;
   }
   async create(input) {
     const jobId = randomUUID();
@@ -456,6 +629,9 @@ class JobsModule {
     if (!job) {
       throw new Error(`failed to create job ${jobId}`);
     }
+    if (this.jsonStore && COMPLETED_STATUSES.includes(job.status)) {
+      await this.jsonStore.write("jobs", job.job_id, job);
+    }
     return job;
   }
   async next(filter) {
@@ -473,16 +649,20 @@ class JobsModule {
            WHERE job_id = $jobId;`).run({ $jobId: job.job_id, $now: now });
       return this.findById(job.job_id);
     });
-    return claim(filter?.role ?? null);
+    const claimedJob = claim(filter?.role ?? null);
+    if (claimedJob && this.jsonStore) {
+      await this.jsonStore.delete("jobs", claimedJob.job_id);
+    }
+    return claimedJob;
   }
   async get(jobId) {
     return this.findById(jobId);
   }
   async complete(jobId, outputPath) {
-    this.updateStatus(jobId, "done", { outputPath: outputPath ?? null });
+    await this.updateStatus(jobId, "done", { outputPath: outputPath ?? null });
   }
   async fail(jobId, error) {
-    this.updateStatus(jobId, "failed");
+    await this.updateStatus(jobId, "failed");
   }
   async list(filter) {
     const status = filter?.status ?? null;
@@ -493,22 +673,33 @@ class JobsModule {
          ORDER BY created_at, job_id;`).all({ $status: status, $role: role });
   }
   async cancel(jobId) {
-    this.updateStatus(jobId, "cancelled");
+    await this.updateStatus(jobId, "cancelled");
   }
   findById(jobId) {
     return this.db.query("SELECT * FROM jobs WHERE job_id = $jobId;").get({ $jobId: jobId });
   }
-  updateStatus(jobId, status, options = {}) {
+  async updateStatus(jobId, status, options = {}) {
     const now = new Date().toISOString();
     if (Object.hasOwn(options, "outputPath")) {
       this.db.query(`UPDATE jobs
            SET status = $status, output_path = $outputPath, updated_at = $now
            WHERE job_id = $jobId;`).run({ $jobId: jobId, $status: status, $outputPath: options.outputPath ?? null, $now: now });
-      return;
+    } else {
+      this.db.query(`UPDATE jobs
+           SET status = $status, updated_at = $now
+           WHERE job_id = $jobId;`).run({ $jobId: jobId, $status: status, $now: now });
     }
-    this.db.query(`UPDATE jobs
-         SET status = $status, updated_at = $now
-         WHERE job_id = $jobId;`).run({ $jobId: jobId, $status: status, $now: now });
+    const job = this.findById(jobId);
+    if (this.jsonStore) {
+      if (COMPLETED_STATUSES.includes(status)) {
+        if (job) {
+          await this.jsonStore.write("jobs", jobId, job);
+        }
+      } else {
+        await this.jsonStore.delete("jobs", jobId);
+      }
+    }
+    return job;
   }
 }
 
@@ -4513,10 +4704,12 @@ var AcceptedContractV1 = exports_external.object({
 // src/modules/reviews.ts
 class ReviewsModule {
   db;
+  jsonStore;
   functions;
   dependencies;
-  constructor(db) {
+  constructor(db, jsonStore) {
     this.db = db;
+    this.jsonStore = jsonStore;
     this.functions = new FunctionsModule(db);
     this.dependencies = new DependenciesModule(db);
   }
@@ -4558,6 +4751,7 @@ class ReviewsModule {
         $rejected: input.rejectedClaims ? JSON.stringify(input.rejectedClaims) : null,
         $createdAt: new Date().toISOString()
       });
+      const result = this.db.query("SELECT last_insert_rowid() AS id;").get();
       for (const dep of parsed.dependencies_used ?? []) {
         this.db.query(`INSERT INTO summary_dependencies (parent_ea, child_ea, child_summary_version_used)
              VALUES ($parent, $child, $version)
@@ -4568,19 +4762,113 @@ class ReviewsModule {
           $version: dep.summary_version
         });
       }
+      return result.id;
+    });
+    const reviewId = tx();
+    if (this.jsonStore) {
+      const fn = await this.functions.get(input.functionEa);
+      if (fn) {
+        await this.jsonStore.write("functions", input.functionEa, fn);
+      }
+      const review = await this.latest(input.functionEa);
+      if (review) {
+        await this.jsonStore.write("reviews", reviewKey(input.functionEa, review.contract_version), review);
+      }
+      for (const dep of parsed.dependencies_used ?? []) {
+        const depRecord = await this.dependencies.get(input.functionEa, dep.ea);
+        if (depRecord) {
+          await this.jsonStore.write("summary_dependencies", summaryDependencyKey(input.functionEa, dep.ea), depRecord);
+        }
+      }
+    }
+    return { id: reviewId };
+  }
+  async amend(input) {
+    if (input.acceptedContract === undefined && input.rejectedClaims === undefined) {
+      throw new Error("acceptedContract or rejectedClaims must be provided");
+    }
+    const existingReview = this.db.query("SELECT * FROM reviews WHERE id = $id;").get({ $id: input.reviewId });
+    if (!existingReview) {
+      throw new Error(`Review ${input.reviewId} not found`);
+    }
+    const parsed = input.acceptedContract === undefined ? undefined : AcceptedContractV1.parse(input.acceptedContract);
+    let amendedReview = null;
+    const tx = this.db.transaction(() => {
+      const review = this.db.query("SELECT * FROM reviews WHERE id = $id;").get({ $id: input.reviewId });
+      if (!review) {
+        throw new Error(`Review ${input.reviewId} not found`);
+      }
+      if (parsed !== undefined) {
+        if (parsed.function_ea !== review.function_ea) {
+          throw new Error("Cannot change review function_ea");
+        }
+        if (parsed.contract_version !== undefined && parsed.contract_version !== review.contract_version) {
+          throw new Error("Cannot change review contract_version");
+        }
+        this.db.query(`UPDATE reviews
+             SET accepted_contract_json = $contractJson,
+                 amend_reason = $reason
+             WHERE id = $id;`).run({
+          $id: input.reviewId,
+          $contractJson: JSON.stringify(parsed),
+          $reason: input.reason
+        });
+        const existingDeps = this.db.query("SELECT child_ea FROM summary_dependencies WHERE parent_ea = $parentEa;").all({ $parentEa: review.function_ea });
+        for (const dep of existingDeps) {
+          this.dependencies.remove(review.function_ea, dep.child_ea);
+        }
+        for (const dep of parsed.dependencies_used ?? []) {
+          this.dependencies.record(review.function_ea, dep.ea, dep.summary_version);
+        }
+      }
+      if (input.rejectedClaims !== undefined) {
+        this.db.query(`UPDATE reviews
+             SET rejected_claims_json = $rejectedClaims
+             WHERE id = $id;`).run({
+          $id: input.reviewId,
+          $rejectedClaims: JSON.stringify(input.rejectedClaims)
+        });
+      }
+      amendedReview = this.db.query("SELECT * FROM reviews WHERE id = $id;").get({ $id: input.reviewId });
     });
     tx();
+    if (this.jsonStore && amendedReview) {
+      await this.jsonStore.write("reviews", reviewKey(amendedReview.function_ea, amendedReview.contract_version), amendedReview);
+      if (parsed !== undefined) {
+        const depKeys = await this.jsonStore.list("summary_dependencies");
+        const parentPrefix = `${summaryDependencyKey(amendedReview.function_ea, "")}`;
+        for (const key of depKeys) {
+          if (key.startsWith(parentPrefix)) {
+            await this.jsonStore.delete("summary_dependencies", key);
+          }
+        }
+        for (const dep of parsed.dependencies_used ?? []) {
+          const depRecord = await this.dependencies.get(amendedReview.function_ea, dep.ea);
+          if (depRecord) {
+            await this.jsonStore.write("summary_dependencies", summaryDependencyKey(amendedReview.function_ea, dep.ea), depRecord);
+          }
+        }
+      }
+    }
   }
   async latest(functionEa) {
     return this.db.query("SELECT * FROM reviews WHERE function_ea = $ea ORDER BY contract_version DESC LIMIT 1;").get({ $ea: functionEa });
+  }
+  async list(functionEa) {
+    return this.db.query("SELECT * FROM reviews WHERE function_ea = $ea ORDER BY contract_version DESC;").all({ $ea: functionEa });
+  }
+  async get(id) {
+    return this.db.query("SELECT * FROM reviews WHERE id = $id;").get({ $id: id });
   }
 }
 
 // src/modules/simplifications.ts
 class SimplificationsModule {
   db;
-  constructor(db) {
+  jsonStore;
+  constructor(db, jsonStore) {
     this.db = db;
+    this.jsonStore = jsonStore;
   }
   async create(input) {
     const result = this.db.query(`INSERT INTO simplifications (
@@ -4598,7 +4886,14 @@ class SimplificationsModule {
       $reviewerRequired: input.reviewerRequired ? 1 : 0,
       $createdAt: new Date().toISOString()
     });
-    return Number(result.lastInsertRowid);
+    const id = Number(result.lastInsertRowid);
+    if (this.jsonStore) {
+      const record = await this.get(id);
+      if (record) {
+        await this.jsonStore.write("simplifications", simplificationKey(input.symbolId, id), record);
+      }
+    }
+    return id;
   }
   async get(id) {
     return this.db.query("SELECT * FROM simplifications WHERE id = $id;").get({ $id: id });
@@ -4611,20 +4906,38 @@ class SimplificationsModule {
   }
   async accept(id) {
     this.db.query("UPDATE simplifications SET accepted = 1 WHERE id = $id;").run({ $id: id });
+    if (this.jsonStore) {
+      const record = await this.get(id);
+      if (record) {
+        await this.jsonStore.write("simplifications", simplificationKey(record.symbol_id, id), record);
+      }
+    }
   }
   async reject(id) {
     this.db.query("UPDATE simplifications SET accepted = 0 WHERE id = $id;").run({ $id: id });
+    if (this.jsonStore) {
+      const record = await this.get(id);
+      if (record) {
+        await this.jsonStore.write("simplifications", simplificationKey(record.symbol_id, id), record);
+      }
+    }
   }
   async remove(id) {
+    const record = await this.get(id);
     this.db.query("DELETE FROM simplifications WHERE id = $id;").run({ $id: id });
+    if (this.jsonStore && record) {
+      await this.jsonStore.delete("simplifications", simplificationKey(record.symbol_id, id));
+    }
   }
 }
 
 // src/modules/sourceBlocks.ts
 class SourceBlocksModule {
   db;
-  constructor(db) {
+  jsonStore;
+  constructor(db, jsonStore) {
     this.db = db;
+    this.jsonStore = jsonStore;
   }
   async create(input) {
     this.db.query(`INSERT INTO source_blocks (
@@ -4642,6 +4955,9 @@ class SourceBlocksModule {
     const block = await this.get(input.blockId);
     if (!block)
       throw new Error("Failed to create source block");
+    if (this.jsonStore) {
+      await this.jsonStore.write("source_blocks", block.block_id, block);
+    }
     return block;
   }
   async get(blockId) {
@@ -4677,12 +4993,21 @@ class SourceBlocksModule {
       return;
     fields.push("updated_at = $updatedAt");
     this.db.query(`UPDATE source_blocks SET ${fields.join(", ")} WHERE block_id = $blockId;`).run(params);
+    if (this.jsonStore) {
+      const block = await this.get(blockId);
+      if (block) {
+        await this.jsonStore.write("source_blocks", blockId, block);
+      }
+    }
   }
   async listManualOverrides() {
     return this.db.query("SELECT * FROM source_blocks WHERE manual_override = 1 ORDER BY block_id;").all();
   }
   async remove(blockId) {
     this.db.query("DELETE FROM source_blocks WHERE block_id = $blockId;").run({ $blockId: blockId });
+    if (this.jsonStore) {
+      await this.jsonStore.delete("source_blocks", blockId);
+    }
   }
 }
 
@@ -4699,8 +5024,10 @@ var UPDATE_COLUMNS = [
 
 class SourceSymbolsModule {
   db;
-  constructor(db) {
+  jsonStore;
+  constructor(db, jsonStore) {
     this.db = db;
+    this.jsonStore = jsonStore;
   }
   async create(input) {
     this.db.query(`INSERT INTO source_symbols (
@@ -4734,6 +5061,9 @@ class SourceSymbolsModule {
     if (!symbol) {
       throw new Error(`Failed to create source symbol ${input.symbolId}`);
     }
+    if (this.jsonStore) {
+      await this.jsonStore.write("source_symbols", symbol.symbol_id, symbol);
+    }
     return symbol;
   }
   async get(symbolId) {
@@ -4759,6 +5089,12 @@ class SourceSymbolsModule {
   }
   async updateStatus(symbolId, status) {
     this.db.query("UPDATE source_symbols SET status = $status WHERE symbol_id = $symbolId;").run({ $symbolId: symbolId, $status: status });
+    if (this.jsonStore) {
+      const symbol = await this.get(symbolId);
+      if (symbol) {
+        await this.jsonStore.write("source_symbols", symbolId, symbol);
+      }
+    }
   }
   async update(symbolId, updates) {
     const setClauses = [];
@@ -4776,17 +5112,28 @@ class SourceSymbolsModule {
       return;
     }
     this.db.query(`UPDATE source_symbols SET ${setClauses.join(", ")} WHERE symbol_id = $symbolId;`).run(params);
+    if (this.jsonStore) {
+      const symbol = await this.get(symbolId);
+      if (symbol) {
+        await this.jsonStore.write("source_symbols", symbolId, symbol);
+      }
+    }
   }
   async remove(symbolId) {
     this.db.query("DELETE FROM source_symbols WHERE symbol_id = $symbolId;").run({ $symbolId: symbolId });
+    if (this.jsonStore) {
+      await this.jsonStore.delete("source_symbols", symbolId);
+    }
   }
 }
 
 // src/modules/stale.ts
 class StaleModule {
   db;
-  constructor(db) {
+  jsonStore;
+  constructor(db, jsonStore) {
     this.db = db;
+    this.jsonStore = jsonStore;
   }
   async markParentsStale(childEa) {
     const tx = this.db.transaction(() => {
@@ -4795,8 +5142,8 @@ class StaleModule {
            JOIN analysis_functions af ON af.ea = sd.child_ea
            WHERE sd.child_ea = $childEa
              AND sd.child_summary_version_used < af.summary_version;`).all({ $childEa: childEa });
-      const parentEas = parents.map((p) => p.parent_ea);
-      for (const parentEa of parentEas) {
+      const parentEas2 = parents.map((p) => p.parent_ea);
+      for (const parentEa of parentEas2) {
         this.db.query(`UPDATE analysis_functions
              SET status = 'stale', updated_at = $updatedAt
              WHERE ea = $ea AND status != 'stale';`).run({
@@ -4804,9 +5151,18 @@ class StaleModule {
           $updatedAt: new Date().toISOString()
         });
       }
-      return parentEas;
+      return parentEas2;
     });
-    return tx();
+    const parentEas = tx();
+    if (this.jsonStore) {
+      for (const parentEa of parentEas) {
+        const parent = await this.get(parentEa);
+        if (parent) {
+          await this.jsonStore.write("functions", parentEa, parent);
+        }
+      }
+    }
+    return parentEas;
   }
   async list() {
     return this.db.query("SELECT * FROM analysis_functions WHERE status = 'stale' ORDER BY ea;").all();
@@ -4814,6 +5170,9 @@ class StaleModule {
   async isStale(functionEa) {
     const row = this.db.query("SELECT status FROM analysis_functions WHERE ea = $ea;").get({ $ea: functionEa });
     return row?.status === "stale";
+  }
+  async get(ea) {
+    return this.db.query("SELECT * FROM analysis_functions WHERE ea = $ea;").get({ $ea: ea });
   }
 }
 
@@ -4876,8 +5235,10 @@ var FunctionAnalysisV1 = exports_external.object({
 // src/modules/workerRuns.ts
 class WorkerRunsModule {
   db;
-  constructor(db) {
+  jsonStore;
+  constructor(db, jsonStore) {
     this.db = db;
+    this.jsonStore = jsonStore;
   }
   async submit(input) {
     const parsed = FunctionAnalysisV1.parse(input.output);
@@ -4899,7 +5260,22 @@ class WorkerRunsModule {
       $outputJson: JSON.stringify(analysis),
       $createdAt: createdAt
     });
-    return Number(result.lastInsertRowid);
+    const id = Number(result.lastInsertRowid);
+    if (this.jsonStore !== undefined) {
+      const key = workerRunKey(input.functionEa, input.role, id);
+      await this.jsonStore.write("worker_runs", key, {
+        id,
+        job_id: input.jobId ?? null,
+        function_ea: input.functionEa,
+        role: input.role,
+        model: input.model,
+        input_hash: input.inputHash ?? null,
+        output_json: JSON.stringify(analysis),
+        output_path: null,
+        created_at: createdAt
+      });
+    }
+    return id;
   }
   async listForFunction(functionEa) {
     return this.db.query("SELECT * FROM worker_runs WHERE function_ea = $functionEa ORDER BY id ASC;").all({ $functionEa: functionEa });
@@ -4907,6 +5283,469 @@ class WorkerRunsModule {
   async get(id) {
     return this.db.query("SELECT * FROM worker_runs WHERE id = $id;").get({ $id: id });
   }
+  async update(id, output) {
+    const existing = await this.get(id);
+    if (existing === null) {
+      throw new Error(`Worker run ${id} not found`);
+    }
+    const parsed = FunctionAnalysisV1.parse(output);
+    const newOutputJson = JSON.stringify({
+      function_ea: existing.function_ea,
+      role: existing.role,
+      model: existing.model,
+      ...existing.job_id ? { job_id: existing.job_id } : {},
+      ...parsed
+    });
+    this.db.query("UPDATE worker_runs SET output_json = $outputJson WHERE id = $id;").run({ $outputJson: newOutputJson, $id: id });
+    if (this.jsonStore !== undefined) {
+      const key = workerRunKey(existing.function_ea, existing.role, id);
+      await this.jsonStore.write("worker_runs", key, {
+        id,
+        job_id: existing.job_id,
+        function_ea: existing.function_ea,
+        role: existing.role,
+        model: existing.model,
+        input_hash: existing.input_hash,
+        output_json: newOutputJson,
+        output_path: existing.output_path,
+        created_at: existing.created_at
+      });
+    }
+  }
+}
+
+// src/persistence/JsonStore.ts
+import { mkdir as mkdir2, readFile as readFile2, readdir, writeFile as writeFile2 } from "fs/promises";
+import { dirname as dirname2, join as join3 } from "path";
+class JsonStore {
+  root;
+  constructor(root) {
+    this.root = root;
+  }
+  async write(tableDir, key, data) {
+    const path = this.recordPath(tableDir, key);
+    await mkdir2(dirname2(path), { recursive: true });
+    await writeFile2(path, `${JSON.stringify(data, null, 2)}
+`, "utf8");
+  }
+  async read(tableDir, key) {
+    const data = await this.readRaw(tableDir, key);
+    if (isTombstone(data)) {
+      return null;
+    }
+    return data;
+  }
+  async delete(tableDir, key) {
+    await this.write(tableDir, key, tombstone(tableDir, key));
+  }
+  async list(tableDir) {
+    const dir = this.tablePath(tableDir);
+    const entries = await safeReadDir(dir, { withFileTypes: true });
+    const keys = [];
+    for (const entry of entries) {
+      if (!entry.isFile() || !entry.name.endsWith(".json")) {
+        continue;
+      }
+      const key = entry.name.slice(0, -".json".length);
+      if (await this.read(tableDir, key) !== null) {
+        keys.push(key);
+      }
+    }
+    return keys.sort();
+  }
+  async listAll() {
+    const workdir = join3(this.root, REWORK_DIR);
+    const entries = await safeReadDir(workdir, { withFileTypes: true });
+    const tables = new Map;
+    for (const entry of entries) {
+      if (!entry.isDirectory()) {
+        continue;
+      }
+      tables.set(entry.name, await this.list(entry.name));
+    }
+    return new Map([...tables.entries()].sort(([left], [right]) => left.localeCompare(right)));
+  }
+  async readRaw(tableDir, key) {
+    try {
+      return JSON.parse(await readFile2(this.recordPath(tableDir, key), "utf8"));
+    } catch (cause) {
+      if (isNotFoundError(cause)) {
+        return null;
+      }
+      throw cause;
+    }
+  }
+  tablePath(tableDir) {
+    return join3(this.root, REWORK_DIR, tableDir);
+  }
+  recordPath(tableDir, key) {
+    return join3(this.tablePath(tableDir), `${key}.json`);
+  }
+}
+
+class InMemoryJsonStore {
+  tables = new Map;
+  async write(tableDir, key, data) {
+    this.table(tableDir).set(key, structuredClone(data));
+  }
+  async read(tableDir, key) {
+    const data = await this.readRaw(tableDir, key);
+    if (isTombstone(data)) {
+      return null;
+    }
+    return data;
+  }
+  async delete(tableDir, key) {
+    await this.write(tableDir, key, tombstone(tableDir, key));
+  }
+  async list(tableDir) {
+    const table = this.tables.get(tableDir);
+    if (table === undefined) {
+      return [];
+    }
+    const keys = [];
+    for (const [key, value] of table.entries()) {
+      if (!isTombstone(value)) {
+        keys.push(key);
+      }
+    }
+    return keys.sort();
+  }
+  async listAll() {
+    const tables = new Map;
+    for (const tableDir of this.tables.keys()) {
+      tables.set(tableDir, await this.list(tableDir));
+    }
+    return new Map([...tables.entries()].sort(([left], [right]) => left.localeCompare(right)));
+  }
+  async readRaw(tableDir, key) {
+    const data = this.tables.get(tableDir)?.get(key);
+    if (data === undefined) {
+      return null;
+    }
+    return structuredClone(data);
+  }
+  table(tableDir) {
+    let table = this.tables.get(tableDir);
+    if (table === undefined) {
+      table = new Map;
+      this.tables.set(tableDir, table);
+    }
+    return table;
+  }
+}
+function tombstone(tableDir, key) {
+  return {
+    _deleted: true,
+    _deleted_at: new Date().toISOString(),
+    _table: tableDir,
+    _key: key
+  };
+}
+function isTombstone(data) {
+  return data?._deleted === true;
+}
+function isNotFoundError(cause) {
+  return cause instanceof Error && "code" in cause && cause.code === "ENOENT";
+}
+async function safeReadDir(path, options) {
+  try {
+    return await readdir(path, options);
+  } catch (cause) {
+    if (isNotFoundError(cause)) {
+      return [];
+    }
+    throw cause;
+  }
+}
+
+// src/persistence/reindex.ts
+import { readdir as readdir2 } from "fs/promises";
+import { join as join4 } from "path";
+var TABLE_ORDER = [
+  "analysis_functions",
+  "analysis_edges",
+  "worker_runs",
+  "reviews",
+  "summary_dependencies",
+  "source_symbols",
+  "source_blocks",
+  "simplifications",
+  "jobs"
+];
+var TABLE_DIR_ALIASES = {
+  analysis_functions: ["functions"],
+  analysis_edges: ["edges"],
+  summary_dependencies: ["dependencies"]
+};
+var INDEXED_JOB_STATUSES = new Set(["done", "cancelled", "failed"]);
+var SQL = {
+  analysis_functions: "INSERT OR REPLACE INTO analysis_functions (ea, status, summary_version, accepted_summary_json, confidence, dirty, last_pseudocode_hash, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+  analysis_edges: "INSERT OR REPLACE INTO analysis_edges (caller_ea, callee_ea, edge_kind, blocking, reason, discovered_at) VALUES (?, ?, ?, ?, ?, ?)",
+  worker_runs: "INSERT OR REPLACE INTO worker_runs (id, job_id, function_ea, role, model, input_hash, output_json, output_path, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+  reviews: "INSERT OR REPLACE INTO reviews (id, function_ea, reviewer_model, contract_version, accepted_contract_json, accepted_contract_path, rejected_claims_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+  summary_dependencies: "INSERT OR REPLACE INTO summary_dependencies (parent_ea, child_ea, child_summary_version_used) VALUES (?, ?, ?)",
+  source_symbols: "INSERT OR REPLACE INTO source_symbols (symbol_id, kind, name, namespace, origin_ea, contract_version, definition_json, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+  source_blocks: "INSERT OR REPLACE INTO source_blocks (block_id, symbol_id, file_path, block_hash, managed, manual_override, fidelity_mode, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+  simplifications: "INSERT OR REPLACE INTO simplifications (id, symbol_id, function_ea, kind, original_json, replacement_json, evidence_json, risk, reviewer_required, accepted, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+  jobs: "INSERT OR REPLACE INTO jobs (job_id, job_type, target, agent_role, status, input_path, output_path, attempt, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+};
+var DELETE_SQL = {
+  analysis_functions: "DELETE FROM analysis_functions WHERE ea = ?",
+  analysis_edges: "DELETE FROM analysis_edges WHERE caller_ea = ? AND callee_ea = ?",
+  worker_runs: "DELETE FROM worker_runs WHERE id = ?",
+  reviews: "DELETE FROM reviews WHERE function_ea = ? AND contract_version = ?",
+  summary_dependencies: "DELETE FROM summary_dependencies WHERE parent_ea = ? AND child_ea = ?",
+  source_symbols: "DELETE FROM source_symbols WHERE symbol_id = ?",
+  source_blocks: "DELETE FROM source_blocks WHERE block_id = ?",
+  simplifications: "DELETE FROM simplifications WHERE id = ?",
+  jobs: "DELETE FROM jobs WHERE job_id = ?"
+};
+async function reindex(root, db) {
+  const jsonStore = new JsonStore(root);
+  const keysByTable = await listKeysIncludingTombstones(root, jsonStore);
+  const rebuild = db.transaction(() => {
+    for (const table of TABLE_ORDER) {
+      const tableDir = TABLE_CONFIGS[table].tableDir;
+      const keys = keysByTable.get(tableDir) ?? [];
+      for (const key of keys) {
+        const record = records.get(`${tableDir}\x00${key}`);
+        if (record === undefined || record === null) {
+          continue;
+        }
+        if (isTombstone2(record)) {
+          db.query(DELETE_SQL[table]).run(...deleteValues(table, key));
+          continue;
+        }
+        const values = insertValues(table, key, record);
+        if (values === null) {
+          continue;
+        }
+        db.query(SQL[table]).run(...values);
+      }
+    }
+  });
+  const records = await readRecords(jsonStore, keysByTable);
+  rebuild();
+}
+async function listKeysIncludingTombstones(root, jsonStore) {
+  const tables = await jsonStore.listAll();
+  const merged = new Map;
+  for (const [tableDir, keys] of tables.entries()) {
+    merged.set(tableDir, new Set(keys));
+  }
+  for (const table of TABLE_ORDER) {
+    const config = TABLE_CONFIGS[table];
+    const keys = merged.get(config.tableDir) ?? new Set;
+    for (const tableDir of tableDirsFor(table)) {
+      for (const key of merged.get(tableDir) ?? []) {
+        keys.add(key);
+      }
+      for (const key of await rawKeys(root, tableDir)) {
+        keys.add(key);
+      }
+    }
+    merged.set(config.tableDir, keys);
+  }
+  return new Map([...merged.entries()].map(([tableDir, keys]) => [tableDir, [...keys].sort()]));
+}
+async function rawKeys(root, tableDir) {
+  try {
+    const entries = await readdir2(join4(root, REWORK_DIR, tableDir), { withFileTypes: true });
+    return entries.filter((entry) => entry.isFile() && entry.name.endsWith(".json")).map((entry) => entry.name.slice(0, -".json".length));
+  } catch (cause) {
+    if (cause instanceof Error && "code" in cause && cause.code === "ENOENT") {
+      return [];
+    }
+    throw cause;
+  }
+}
+async function readRecords(jsonStore, keysByTable) {
+  const records = new Map;
+  for (const [tableDir, keys] of keysByTable.entries()) {
+    for (const key of keys) {
+      records.set(`${tableDir}\x00${key}`, await readRawFromDirs(jsonStore, tableDirsForCanonical(tableDir), key));
+    }
+  }
+  return records;
+}
+async function readRawFromDirs(jsonStore, tableDirs, key) {
+  let record = null;
+  for (const tableDir of tableDirs) {
+    const candidate = await jsonStore.readRaw(tableDir, key);
+    if (candidate !== null) {
+      record = candidate;
+    }
+  }
+  return record;
+}
+function tableDirsFor(table) {
+  return [TABLE_CONFIGS[table].tableDir, ...TABLE_DIR_ALIASES[table] ?? []];
+}
+function tableDirsForCanonical(tableDir) {
+  for (const table of TABLE_ORDER) {
+    if (TABLE_CONFIGS[table].tableDir === tableDir) {
+      return tableDirsFor(table);
+    }
+  }
+  return [tableDir];
+}
+function insertValues(table, key, record) {
+  switch (table) {
+    case "analysis_functions": {
+      const ea = stringValue(record.ea) ?? key;
+      return [
+        ea,
+        binding(record.status),
+        binding(record.summary_version),
+        binding(record.accepted_summary_json),
+        binding(record.confidence),
+        binding(record.dirty),
+        binding(record.last_pseudocode_hash),
+        binding(record.updated_at)
+      ];
+    }
+    case "analysis_edges": {
+      const [callerEa, calleeEa] = splitKey(key, 2);
+      return [
+        stringValue(record.caller_ea) ?? callerEa,
+        stringValue(record.callee_ea) ?? calleeEa,
+        binding(record.edge_kind),
+        binding(record.blocking),
+        binding(record.reason),
+        binding(record.discovered_at)
+      ];
+    }
+    case "worker_runs": {
+      const [functionEa, role, id] = splitKey(key, 3);
+      return [
+        numberValue(record.id) ?? Number(id),
+        binding(record.job_id),
+        stringValue(record.function_ea) ?? functionEa,
+        stringValue(record.role) ?? role,
+        binding(record.model),
+        binding(record.input_hash),
+        binding(record.output_json),
+        binding(record.output_path),
+        binding(record.created_at)
+      ];
+    }
+    case "reviews": {
+      const [functionEa, version] = splitKey(key, 2);
+      return [
+        binding(record.id),
+        stringValue(record.function_ea) ?? functionEa,
+        binding(record.reviewer_model),
+        numberValue(record.contract_version) ?? Number(version.replace(/^v/, "")),
+        binding(record.accepted_contract_json),
+        binding(record.accepted_contract_path),
+        binding(record.rejected_claims_json),
+        binding(record.created_at)
+      ];
+    }
+    case "summary_dependencies": {
+      const [parentEa, childEa] = splitKey(key, 2);
+      return [
+        stringValue(record.parent_ea) ?? parentEa,
+        stringValue(record.child_ea) ?? childEa,
+        binding(record.child_summary_version_used)
+      ];
+    }
+    case "source_symbols":
+      return [
+        stringValue(record.symbol_id) ?? key,
+        binding(record.kind),
+        binding(record.name),
+        binding(record.namespace),
+        binding(record.origin_ea),
+        binding(record.contract_version),
+        binding(record.definition_json),
+        binding(record.status)
+      ];
+    case "source_blocks":
+      return [
+        stringValue(record.block_id) ?? key,
+        binding(record.symbol_id),
+        binding(record.file_path),
+        binding(record.block_hash),
+        binding(record.managed),
+        binding(record.manual_override),
+        binding(record.fidelity_mode),
+        binding(record.updated_at)
+      ];
+    case "simplifications": {
+      const [symbolId, id] = splitKey(key, 2);
+      return [
+        numberValue(record.id) ?? Number(id),
+        stringValue(record.symbol_id) ?? symbolId,
+        binding(record.function_ea),
+        binding(record.kind),
+        binding(record.original_json),
+        binding(record.replacement_json),
+        binding(record.evidence_json),
+        binding(record.risk),
+        binding(record.reviewer_required),
+        binding(record.accepted),
+        binding(record.created_at)
+      ];
+    }
+    case "jobs":
+      if (typeof record.status !== "string" || !INDEXED_JOB_STATUSES.has(record.status)) {
+        return null;
+      }
+      return [
+        stringValue(record.job_id) ?? key,
+        binding(record.job_type),
+        binding(record.target),
+        binding(record.agent_role),
+        binding(record.status),
+        binding(record.input_path),
+        binding(record.output_path),
+        binding(record.attempt),
+        binding(record.created_at),
+        binding(record.updated_at)
+      ];
+  }
+}
+function deleteValues(table, key) {
+  switch (table) {
+    case "analysis_edges":
+    case "summary_dependencies":
+      return splitKey(key, 2);
+    case "worker_runs":
+      return [Number(splitKey(key, 3)[2])];
+    case "reviews":
+      return splitKey(key, 2).map((part, index) => index === 1 ? Number(part.replace(/^v/, "")) : part);
+    case "simplifications":
+      return [Number(splitKey(key, 2)[1])];
+    default:
+      return [key];
+  }
+}
+function splitKey(key, segments) {
+  const parts = key.split("__");
+  if (parts.length !== segments) {
+    throw new Error(`invalid reindex key ${key}`);
+  }
+  return parts;
+}
+function stringValue(value) {
+  return typeof value === "string" ? value : null;
+}
+function numberValue(value) {
+  return typeof value === "number" ? value : null;
+}
+function binding(value) {
+  if (value === undefined || value === null) {
+    return null;
+  }
+  if (typeof value === "string" || typeof value === "number" || typeof value === "boolean" || typeof value === "bigint") {
+    return value;
+  }
+  return JSON.stringify(value);
+}
+function isTombstone2(record) {
+  return record?._deleted === true;
 }
 
 // src/traversal/scc.ts
@@ -5052,21 +5891,19 @@ class ReProgress {
   simplifications;
   artifacts;
   traversal;
-  root;
-  constructor(db, root) {
+  constructor(db, root, jsonStore) {
     this.db = db;
-    this.root = root;
-    this.functions = new FunctionsModule(db);
-    this.edges = new EdgesModule(db);
-    this.jobs = new JobsModule(db);
-    this.workers = new WorkerRunsModule(db);
-    this.reviews = new ReviewsModule(db);
-    this.dependencies = new DependenciesModule(db);
-    this.stale = new StaleModule(db);
+    this.functions = new FunctionsModule(db, jsonStore);
+    this.edges = new EdgesModule(db, jsonStore);
+    this.jobs = new JobsModule(db, jsonStore);
+    this.workers = new WorkerRunsModule(db, jsonStore);
+    this.reviews = new ReviewsModule(db, jsonStore);
+    this.dependencies = new DependenciesModule(db, jsonStore);
+    this.stale = new StaleModule(db, jsonStore);
     this.tree = new StatusTreeModule(db);
-    this.sourceSymbols = new SourceSymbolsModule(db);
-    this.sourceBlocks = new SourceBlocksModule(db);
-    this.simplifications = new SimplificationsModule(db);
+    this.sourceSymbols = new SourceSymbolsModule(db, jsonStore);
+    this.sourceBlocks = new SourceBlocksModule(db, jsonStore);
+    this.simplifications = new SimplificationsModule(db, jsonStore);
     this.artifacts = new ArtifactsModule(root);
     this.traversal = { detectSccs, topologicalOrder, traversalPlan };
   }
@@ -5074,7 +5911,9 @@ class ReProgress {
     ensureWorkdir(options.root);
     const db = openDatabase(options.root);
     runMigrations(db);
-    return new ReProgress(db, options.root);
+    const jsonStore = new JsonStore(options.root);
+    await reindex(options.root, db);
+    return new ReProgress(db, options.root, jsonStore);
   }
   close() {
     closeDatabase(this.db);
@@ -5163,6 +6002,28 @@ var OpenJePlugin = async ({ client, directory, worktree }) => {
           return jsonResult(fn);
         }
       }),
+      re_function_unregister: tool({
+        description: "Unregister a function from the ledger",
+        args: {
+          ea: tool.schema.string().describe("Function effective address"),
+          reason: tool.schema.string().describe("Reason for unregistering")
+        },
+        async execute(args, _ctx) {
+          try {
+            await re.functions.unregister(args.ea, args.reason);
+            return jsonResult({ unregistered: args.ea, reason: args.reason });
+          } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            if (msg.includes("not found")) {
+              return errorResult(msg, "NOT_FOUND");
+            }
+            if (msg.includes("Cannot unregister")) {
+              return errorResult(msg, "DEPENDENCY_ERROR");
+            }
+            throw err;
+          }
+        }
+      }),
       re_function_set_status: tool({
         description: "Set function status",
         args: {
@@ -5204,6 +6065,22 @@ var OpenJePlugin = async ({ client, directory, worktree }) => {
           return jsonResult({ added: `${args.caller} -> ${args.callee}` });
         }
       }),
+      re_edge_remove: tool({
+        description: "Remove an edge between functions",
+        args: {
+          caller: tool.schema.string().describe("Caller EA"),
+          callee: tool.schema.string().describe("Callee EA"),
+          reason: tool.schema.string().describe("Reason for removal")
+        },
+        async execute(args, _ctx) {
+          try {
+            await re.edges.remove(args.caller, args.callee);
+            return jsonResult({ removed: `${args.caller} -> ${args.callee}` });
+          } catch (err) {
+            return errorResult(err.message, "NOT_FOUND");
+          }
+        }
+      }),
       re_job_create: tool({
         description: "Create a job",
         args: {
@@ -5234,13 +6111,49 @@ var OpenJePlugin = async ({ client, directory, worktree }) => {
           return jsonResult(job);
         }
       }),
+      re_job_cancel: tool({
+        description: "Cancel a job",
+        args: {
+          job_id: tool.schema.string().describe("Job ID to cancel"),
+          reason: tool.schema.string().describe("Reason for cancellation")
+        },
+        async execute(args, _ctx) {
+          try {
+            await re.jobs.cancel(args.job_id);
+            return jsonResult({ cancelled: args.job_id });
+          } catch (err) {
+            return errorResult(`Job ${args.job_id} not found`, "NOT_FOUND");
+          }
+        }
+      }),
       re_worker_submit: tool({
-        description: "Submit worker run output",
+        description: "Submit a worker run with structured analysis output",
         args: {
           function_ea: tool.schema.string().describe("Function EA"),
           role: tool.schema.string().describe("Worker role"),
           model: tool.schema.string().describe("Model name"),
-          output: tool.schema.string().describe('Worker analysis as JSON. Required: {"purpose":{"summary":"...","confidence":0.85,"evidence":["..."]}}. Optional: inputs[], return_value, side_effects[], uncertainties[]'),
+          output: tool.schema.object({
+            purpose: tool.schema.object({
+              summary: tool.schema.string().describe("What this function does"),
+              confidence: tool.schema.number().min(0).max(1).describe("Confidence 0-1"),
+              evidence: tool.schema.array(tool.schema.string()).describe("Supporting evidence")
+            }).describe("Function purpose"),
+            inputs: tool.schema.array(tool.schema.object({
+              original: tool.schema.string().describe("Original parameter name"),
+              proposed_name: tool.schema.string().optional().describe("Suggested parameter name"),
+              type: tool.schema.string().optional().describe("Parameter type"),
+              confidence: tool.schema.number().min(0).max(1).optional().describe("Confidence 0-1"),
+              evidence: tool.schema.array(tool.schema.string()).optional().describe("Supporting evidence")
+            })).default([]).describe("Function inputs"),
+            return_value: tool.schema.object({
+              type: tool.schema.string().optional().describe("Return type"),
+              meaning: tool.schema.string().optional().describe("Return value meaning"),
+              confidence: tool.schema.number().min(0).max(1).optional().describe("Confidence 0-1"),
+              evidence: tool.schema.array(tool.schema.string()).optional().describe("Supporting evidence")
+            }).optional().describe("Return value analysis"),
+            side_effects: tool.schema.array(tool.schema.unknown()).default([]).describe("Side effects"),
+            uncertainties: tool.schema.array(tool.schema.string()).default([]).describe("Uncertainties")
+          }).describe("Worker analysis output"),
           job_id: tool.schema.string().describe("Job ID").optional()
         },
         async execute(args, _ctx) {
@@ -5249,27 +6162,177 @@ var OpenJePlugin = async ({ client, directory, worktree }) => {
             functionEa: args.function_ea,
             role: args.role,
             model: args.model,
-            output: JSON.parse(args.output)
+            output: args.output
           });
           return jsonResult({ id });
         }
       }),
+      re_worker_run_update: tool({
+        description: "Update a worker run with new analysis output",
+        args: {
+          id: tool.schema.number().describe("Worker run ID"),
+          output: tool.schema.object({
+            purpose: tool.schema.object({
+              summary: tool.schema.string().describe("What this function does"),
+              confidence: tool.schema.number().min(0).max(1).describe("Confidence 0-1"),
+              evidence: tool.schema.array(tool.schema.string()).describe("Supporting evidence")
+            }).describe("Function purpose"),
+            inputs: tool.schema.array(tool.schema.object({
+              original: tool.schema.string().describe("Original parameter name"),
+              proposed_name: tool.schema.string().optional().describe("Suggested parameter name"),
+              type: tool.schema.string().optional().describe("Parameter type"),
+              confidence: tool.schema.number().min(0).max(1).optional().describe("Confidence 0-1"),
+              evidence: tool.schema.array(tool.schema.string()).optional().describe("Supporting evidence")
+            })).default([]).describe("Function inputs"),
+            return_value: tool.schema.object({
+              type: tool.schema.string().optional().describe("Return type"),
+              meaning: tool.schema.string().optional().describe("Return value meaning"),
+              confidence: tool.schema.number().min(0).max(1).optional().describe("Confidence 0-1"),
+              evidence: tool.schema.array(tool.schema.string()).optional().describe("Supporting evidence")
+            }).optional().describe("Return value analysis"),
+            side_effects: tool.schema.array(tool.schema.unknown()).default([]).describe("Side effects"),
+            uncertainties: tool.schema.array(tool.schema.string()).default([]).describe("Uncertainties")
+          }).describe("Worker analysis output"),
+          reason: tool.schema.string().describe("Reason for the update")
+        },
+        async execute(args, _ctx) {
+          try {
+            const existing = await re.workers.get(args.id);
+            if (existing === null) {
+              return errorResult(`Worker run ${args.id} not found`, "NOT_FOUND");
+            }
+            await re.workers.update(args.id, args.output);
+            const functionEa = existing.function_ea;
+            const latestReview = await re.reviews.latest(functionEa);
+            if (latestReview !== null) {
+              return jsonResult({
+                updated: args.id,
+                reason: args.reason,
+                warning: `Function ${functionEa} has reviews \u2014 consider re-reviewing after this update`
+              });
+            }
+            return jsonResult({ updated: args.id, reason: args.reason });
+          } catch (err) {
+            const message = err instanceof Error ? err.message : String(err);
+            return errorResult(message, "VALIDATION_ERROR");
+          }
+        }
+      }),
       re_review_submit: tool({
-        description: "Submit a review contract",
+        description: "Submit a review contract with structured fields",
         args: {
           function_ea: tool.schema.string().describe("Function EA"),
           reviewer_model: tool.schema.string().describe("Reviewer model"),
-          contract: tool.schema.string().describe('Accepted contract as JSON. Required: {"accepted_name":"...","kind":"function","purpose":"...","confidence":0.9}. Kind: function|method|constructor|destructor|thunk|unknown. Optional: accepted_prototype, owner, return_value, accepted_variable_names, dependencies_used, rejected_claims'),
-          rejected_claims: tool.schema.string().describe("Rejected claims as JSON string array").optional()
+          contract: tool.schema.object({
+            contract_version: tool.schema.number().int().nonnegative().optional().describe("Contract version"),
+            accepted_name: tool.schema.string().describe("Accepted function name"),
+            accepted_prototype: tool.schema.string().optional().describe("Function prototype/signature"),
+            kind: tool.schema.enum(["function", "method", "constructor", "destructor", "thunk", "unknown"]).describe("Function kind"),
+            owner: tool.schema.string().optional().describe("Class/struct owner"),
+            purpose: tool.schema.string().describe("Function purpose description"),
+            return_value: tool.schema.object({
+              type: tool.schema.string().optional().describe("Return type"),
+              meaning: tool.schema.string().optional().describe("Return value meaning")
+            }).optional().describe("Return value"),
+            accepted_variable_names: tool.schema.record(tool.schema.string(), tool.schema.string()).default({}).describe("Variable name mappings"),
+            dependencies_used: tool.schema.array(tool.schema.object({
+              ea: tool.schema.string().describe("Dependency EA"),
+              summary_version: tool.schema.number().int().nonnegative().describe("Summary version used")
+            })).default([]).describe("Dependencies used"),
+            confidence: tool.schema.number().min(0).max(1).describe("Confidence 0-1")
+          }).describe("Accepted review contract (function_ea is auto-filled from top-level parameter)"),
+          rejected_claims: tool.schema.array(tool.schema.object({
+            claim: tool.schema.string().describe("Claim description"),
+            reason: tool.schema.string().describe("Reason for rejection")
+          })).describe("Rejected claims").optional()
         },
         async execute(args, _ctx) {
-          await re.reviews.submit({
+          const result = await re.reviews.submit({
             functionEa: args.function_ea,
             reviewerModel: args.reviewer_model,
-            acceptedContract: JSON.parse(args.contract),
-            rejectedClaims: args.rejected_claims ? JSON.parse(args.rejected_claims) : undefined
+            acceptedContract: { ...args.contract, function_ea: args.function_ea },
+            rejectedClaims: args.rejected_claims
           });
-          return jsonResult({ reviewed: args.function_ea });
+          return jsonResult({ reviewed: args.function_ea, review_id: result.id });
+        }
+      }),
+      re_review_amend: tool({
+        description: "Amend an existing review contract",
+        args: {
+          review_id: tool.schema.number().int().nonnegative().describe("Review ID to amend"),
+          contract: tool.schema.object({
+            contract_version: tool.schema.number().int().nonnegative().optional().describe("Contract version"),
+            accepted_name: tool.schema.string().describe("Accepted function name"),
+            accepted_prototype: tool.schema.string().optional().describe("Function prototype/signature"),
+            kind: tool.schema.enum(["function", "method", "constructor", "destructor", "thunk", "unknown"]).describe("Function kind"),
+            owner: tool.schema.string().optional().describe("Class/struct owner"),
+            purpose: tool.schema.string().describe("Function purpose description"),
+            return_value: tool.schema.object({
+              type: tool.schema.string().optional().describe("Return type"),
+              meaning: tool.schema.string().optional().describe("Return value meaning")
+            }).optional().describe("Return value"),
+            accepted_variable_names: tool.schema.record(tool.schema.string(), tool.schema.string()).default({}).describe("Variable name mappings"),
+            dependencies_used: tool.schema.array(tool.schema.object({
+              ea: tool.schema.string().describe("Dependency EA"),
+              summary_version: tool.schema.number().int().nonnegative().describe("Summary version used")
+            })).default([]).describe("Dependencies used"),
+            confidence: tool.schema.number().min(0).max(1).describe("Confidence 0-1")
+          }).describe("Amended accepted contract").optional(),
+          rejected_claims: tool.schema.array(tool.schema.object({
+            claim: tool.schema.string().describe("Claim description"),
+            reason: tool.schema.string().describe("Reason for rejection")
+          })).describe("Rejected claims").optional(),
+          reason: tool.schema.string().describe("Reason for amendment")
+        },
+        async execute(args, _ctx) {
+          if (args.contract === undefined && args.rejected_claims === undefined) {
+            return errorResult("Either contract or rejected_claims must be provided", "BAD_REQUEST");
+          }
+          let acceptedContract = args.contract;
+          if (args.contract !== undefined) {
+            const existingReview = await re.reviews.get(args.review_id);
+            if (existingReview === null) {
+              return errorResult(`Review ${args.review_id} not found`, "NOT_FOUND");
+            }
+            acceptedContract = { ...args.contract, function_ea: existingReview.function_ea };
+          }
+          try {
+            await re.reviews.amend({
+              reviewId: args.review_id,
+              acceptedContract,
+              rejectedClaims: args.rejected_claims,
+              reason: args.reason
+            });
+            return jsonResult({ amended: args.review_id, reason: args.reason });
+          } catch (err) {
+            if (err instanceof Error && err.message.includes("not found")) {
+              return errorResult(`Review ${args.review_id} not found`, "NOT_FOUND");
+            }
+            throw err;
+          }
+        }
+      }),
+      re_review_list: tool({
+        description: "List all reviews for a function",
+        args: {
+          function_ea: tool.schema.string().describe("Function EA")
+        },
+        async execute(args, _ctx) {
+          const reviews = await re.reviews.list(args.function_ea);
+          return jsonResult(reviews);
+        }
+      }),
+      re_review_get: tool({
+        description: "Get a review by ID",
+        args: {
+          review_id: tool.schema.number().int().nonnegative().describe("Review ID")
+        },
+        async execute(args, _ctx) {
+          const review = await re.reviews.get(args.review_id);
+          if (!review) {
+            return errorResult(`Review ${args.review_id} not found`, "NOT_FOUND");
+          }
+          return jsonResult(review);
         }
       }),
       re_stale_mark_parents: tool({

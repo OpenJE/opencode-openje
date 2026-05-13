@@ -2,11 +2,17 @@ import { describe, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
 import { runMigrations } from "../db/migrations.js";
 import { JobsModule } from "./jobs.js";
+import { InMemoryJsonStore } from "../persistence/JsonStore.js";
+import type { JsonStore } from "../persistence/types.js";
 
-function createModule(): { db: Database; jobs: JobsModule } {
+function createModule(jsonStore?: JsonStore): { db: Database; jobs: JobsModule; jsonStore: JsonStore | undefined } {
   const db = new Database(":memory:");
   runMigrations(db);
-  return { db, jobs: new JobsModule(db) };
+  return { db, jobs: new JobsModule(db, jsonStore), jsonStore };
+}
+
+async function createInMemoryJsonStore(): Promise<InMemoryJsonStore> {
+  return new InMemoryJsonStore();
 }
 
 describe("JobsModule", () => {
@@ -172,3 +178,107 @@ describe("JobsModule", () => {
 async function jobIds(jobsPromise: Promise<Array<{ job_id: string }>>): Promise<string[]> {
   return (await jobsPromise).map((job) => job.job_id);
 }
+
+describe("JobsModule JSON persistence", () => {
+  test("does not persist queued job to JSON", async () => {
+    const store = await createInMemoryJsonStore();
+    const { db, jobs } = createModule(store);
+    try {
+      const job = await jobs.create({ jobType: "analyze_function_semantics", target: "401000" });
+      expect(job.status).toBe("queued");
+
+      const persisted = await store.read("jobs", job.job_id);
+      expect(persisted).toBeNull();
+    } finally {
+      db.close();
+    }
+  });
+
+  test("does not persist running job to JSON after next()", async () => {
+    const store = await createInMemoryJsonStore();
+    const { db, jobs } = createModule(store);
+    try {
+      const job = await jobs.create({ jobType: "analyze_function_semantics", target: "401000" });
+      expect(job.status).toBe("queued");
+
+      await store.write("jobs", job.job_id, { status: "queued" } as Record<string, unknown>);
+
+      const claimed = await jobs.next();
+      expect(claimed?.status).toBe("running");
+
+      const persisted = await store.read("jobs", job.job_id);
+      expect(persisted).toBeNull();
+    } finally {
+      db.close();
+    }
+  });
+
+  test("persists done job to JSON after complete()", async () => {
+    const store = await createInMemoryJsonStore();
+    const { db, jobs } = createModule(store);
+    try {
+      const job = await jobs.create({ jobType: "analyze_function_semantics", target: "401000" });
+      await jobs.complete(job.job_id, ".rework/output.json");
+
+      const persisted = await store.read("jobs", job.job_id);
+      expect(persisted).not.toBeNull();
+      expect(persisted).toMatchObject({
+        job_id: job.job_id,
+        status: "done",
+        output_path: ".rework/output.json",
+      });
+    } finally {
+      db.close();
+    }
+  });
+
+  test("persists cancelled job to JSON after cancel()", async () => {
+    const store = await createInMemoryJsonStore();
+    const { db, jobs } = createModule(store);
+    try {
+      const job = await jobs.create({ jobType: "analyze_function_semantics", target: "401000" });
+      await jobs.cancel(job.job_id);
+
+      const persisted = await store.read("jobs", job.job_id);
+      expect(persisted).not.toBeNull();
+      expect(persisted).toMatchObject({
+        job_id: job.job_id,
+        status: "cancelled",
+      });
+    } finally {
+      db.close();
+    }
+  });
+
+  test("persists failed job to JSON after fail()", async () => {
+    const store = await createInMemoryJsonStore();
+    const { db, jobs } = createModule(store);
+    try {
+      const job = await jobs.create({ jobType: "analyze_function_semantics", target: "401000" });
+      await jobs.fail(job.job_id, "analysis timeout");
+
+      const persisted = await store.read("jobs", job.job_id);
+      expect(persisted).not.toBeNull();
+      expect(persisted).toMatchObject({
+        job_id: job.job_id,
+        status: "failed",
+      });
+    } finally {
+      db.close();
+    }
+  });
+
+  test("skips JSON persistence when jsonStore is undefined", async () => {
+    const { db, jobs, jsonStore } = createModule(undefined);
+    try {
+      expect(jsonStore).toBeUndefined();
+
+      const job = await jobs.create({ jobType: "analyze_function_semantics", target: "401000" });
+      await jobs.complete(job.job_id);
+
+      await expect(jobs.get(job.job_id)).resolves.toMatchObject({ status: "done" });
+    } finally {
+      db.close();
+    }
+  });
+});

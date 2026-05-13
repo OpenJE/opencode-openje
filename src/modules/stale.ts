@@ -1,8 +1,9 @@
 import type { Database } from "bun:sqlite";
 import type { AnalysisFunction } from "../db/types.js";
+import type { JsonStore } from "../persistence/types.js";
 
 export class StaleModule {
-  constructor(private readonly db: Database) {}
+  constructor(private readonly db: Database, private readonly jsonStore?: JsonStore) {}
 
   async markParentsStale(childEa: string): Promise<string[]> {
     const tx = this.db.transaction(() => {
@@ -32,7 +33,18 @@ export class StaleModule {
       return parentEas;
     });
 
-    return tx();
+    const parentEas = tx();
+
+    if (this.jsonStore) {
+      for (const parentEa of parentEas) {
+        const parent = await this.get(parentEa);
+        if (parent) {
+          await this.jsonStore.write("functions", parentEa, parent as unknown as Record<string, unknown>);
+        }
+      }
+    }
+
+    return parentEas;
   }
 
   async list(): Promise<AnalysisFunction[]> {
@@ -46,5 +58,11 @@ export class StaleModule {
       .query("SELECT status FROM analysis_functions WHERE ea = $ea;")
       .get({ $ea: functionEa }) as { status: string } | null;
     return row?.status === "stale";
+  }
+
+  private async get(ea: string): Promise<AnalysisFunction | null> {
+    return this.db
+      .query("SELECT * FROM analysis_functions WHERE ea = $ea;")
+      .get({ $ea: ea }) as AnalysisFunction | null;
   }
 }

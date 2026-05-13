@@ -3,6 +3,8 @@ import { AcceptedContractV1 } from "../schemas/AcceptedContractV1.js";
 import type { Review } from "../db/types.js";
 import { FunctionsModule } from "./functions.js";
 import { DependenciesModule } from "./dependencies.js";
+import type { JsonStore } from "../persistence/types.js";
+import { reviewKey, summaryDependencyKey } from "../persistence/types.js";
 
 export interface SubmitReviewInput {
   functionEa: string;
@@ -10,6 +12,13 @@ export interface SubmitReviewInput {
   acceptedContract: unknown;
   rejectedClaims?: unknown[];
   acceptedContractPath?: string;
+}
+
+export interface AmendReviewInput {
+  reviewId: number;
+  acceptedContract?: unknown;
+  rejectedClaims?: unknown[];
+  reason: string;
 }
 
 export interface ReviewBundle {
@@ -23,7 +32,7 @@ export class ReviewsModule {
   private functions: FunctionsModule;
   private dependencies: DependenciesModule;
 
-  constructor(private readonly db: Database) {
+  constructor(private readonly db: Database, private readonly jsonStore?: JsonStore) {
     this.functions = new FunctionsModule(db);
     this.dependencies = new DependenciesModule(db);
   }
@@ -42,10 +51,10 @@ export class ReviewsModule {
     return { functionEa, workerRuns, edges, dependencies };
   }
 
-  async submit(input: SubmitReviewInput): Promise<void> {
+  async submit(input: SubmitReviewInput): Promise<{ id: number }> {
     const parsed = AcceptedContractV1.parse(input.acceptedContract);
 
-    const tx = this.db.transaction(() => {
+    const tx = this.db.transaction((): number => {
       const fn = this.db
         .query("SELECT * FROM analysis_functions WHERE ea = $ea;")
         .get({ $ea: input.functionEa }) as { summary_version: number } | null;
@@ -88,6 +97,8 @@ export class ReviewsModule {
           $createdAt: new Date().toISOString(),
         });
 
+      const result = this.db.query("SELECT last_insert_rowid() AS id;").get() as { id: number };
+
       for (const dep of parsed.dependencies_used ?? []) {
         this.db
           .query(
@@ -102,9 +113,137 @@ export class ReviewsModule {
             $version: dep.summary_version,
           });
       }
+
+      return result.id;
+    });
+
+    const reviewId = tx();
+
+    if (this.jsonStore) {
+      const fn = await this.functions.get(input.functionEa);
+      if (fn) {
+        await this.jsonStore.write("functions", input.functionEa, fn as unknown as Record<string, unknown>);
+      }
+
+      const review = await this.latest(input.functionEa);
+      if (review) {
+        await this.jsonStore.write("reviews", reviewKey(input.functionEa, review.contract_version), review as unknown as Record<string, unknown>);
+      }
+
+      for (const dep of parsed.dependencies_used ?? []) {
+        const depRecord = await this.dependencies.get(input.functionEa, dep.ea);
+        if (depRecord) {
+          await this.jsonStore.write("summary_dependencies", summaryDependencyKey(input.functionEa, dep.ea), depRecord as unknown as Record<string, unknown>);
+        }
+      }
+    }
+
+    return { id: reviewId };
+  }
+
+  async amend(input: AmendReviewInput): Promise<void> {
+    if (input.acceptedContract === undefined && input.rejectedClaims === undefined) {
+      throw new Error("acceptedContract or rejectedClaims must be provided");
+    }
+
+    const existingReview = this.db
+      .query("SELECT * FROM reviews WHERE id = $id;")
+      .get({ $id: input.reviewId }) as Review | null;
+    if (!existingReview) {
+      throw new Error(`Review ${input.reviewId} not found`);
+    }
+
+    const parsed = input.acceptedContract === undefined ? undefined : AcceptedContractV1.parse(input.acceptedContract);
+    let amendedReview: Review | null = null;
+
+    const tx = this.db.transaction(() => {
+      const review = this.db
+        .query("SELECT * FROM reviews WHERE id = $id;")
+        .get({ $id: input.reviewId }) as Review | null;
+      if (!review) {
+        throw new Error(`Review ${input.reviewId} not found`);
+      }
+
+      if (parsed !== undefined) {
+        if (parsed.function_ea !== review.function_ea) {
+          throw new Error("Cannot change review function_ea");
+        }
+        if (parsed.contract_version !== undefined && parsed.contract_version !== review.contract_version) {
+          throw new Error("Cannot change review contract_version");
+        }
+
+        this.db
+          .query(
+            `UPDATE reviews
+             SET accepted_contract_json = $contractJson,
+                 amend_reason = $reason
+             WHERE id = $id;`,
+          )
+          .run({
+            $id: input.reviewId,
+            $contractJson: JSON.stringify(parsed),
+            $reason: input.reason,
+          });
+
+        const existingDeps = this.db
+          .query("SELECT child_ea FROM summary_dependencies WHERE parent_ea = $parentEa;")
+          .all({ $parentEa: review.function_ea }) as { child_ea: string }[];
+        for (const dep of existingDeps) {
+          void this.dependencies.remove(review.function_ea, dep.child_ea);
+        }
+        for (const dep of parsed.dependencies_used ?? []) {
+          void this.dependencies.record(review.function_ea, dep.ea, dep.summary_version);
+        }
+      }
+
+      if (input.rejectedClaims !== undefined) {
+        this.db
+          .query(
+            `UPDATE reviews
+             SET rejected_claims_json = $rejectedClaims
+             WHERE id = $id;`,
+          )
+          .run({
+            $id: input.reviewId,
+            $rejectedClaims: JSON.stringify(input.rejectedClaims),
+          });
+      }
+
+      amendedReview = this.db
+        .query("SELECT * FROM reviews WHERE id = $id;")
+        .get({ $id: input.reviewId }) as Review | null;
     });
 
     tx();
+
+    if (this.jsonStore && amendedReview) {
+      await this.jsonStore.write(
+        "reviews",
+        reviewKey(amendedReview.function_ea, amendedReview.contract_version),
+        amendedReview as unknown as Record<string, unknown>,
+      );
+
+      if (parsed !== undefined) {
+        const depKeys = await this.jsonStore.list("summary_dependencies");
+        const parentPrefix = `${summaryDependencyKey(amendedReview.function_ea, "")}`;
+        for (const key of depKeys) {
+          if (key.startsWith(parentPrefix)) {
+            await this.jsonStore.delete("summary_dependencies", key);
+          }
+        }
+
+        for (const dep of parsed.dependencies_used ?? []) {
+          const depRecord = await this.dependencies.get(amendedReview.function_ea, dep.ea);
+          if (depRecord) {
+            await this.jsonStore.write(
+              "summary_dependencies",
+              summaryDependencyKey(amendedReview.function_ea, dep.ea),
+              depRecord as unknown as Record<string, unknown>,
+            );
+          }
+        }
+      }
+    }
   }
 
   async latest(functionEa: string): Promise<Review | null> {
@@ -113,5 +252,17 @@ export class ReviewsModule {
         "SELECT * FROM reviews WHERE function_ea = $ea ORDER BY contract_version DESC LIMIT 1;",
       )
       .get({ $ea: functionEa }) as Review | null;
+  }
+
+  async list(functionEa: string): Promise<Review[]> {
+    return this.db
+      .query("SELECT * FROM reviews WHERE function_ea = $ea ORDER BY contract_version DESC;")
+      .all({ $ea: functionEa }) as Review[];
+  }
+
+  async get(id: number): Promise<Review | null> {
+    return this.db
+      .query("SELECT * FROM reviews WHERE id = $id;")
+      .get({ $id: id }) as Review | null;
   }
 }

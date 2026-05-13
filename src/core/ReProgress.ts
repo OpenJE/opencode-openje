@@ -13,6 +13,8 @@ import { SourceSymbolsModule } from "../modules/sourceSymbols.js";
 import { StaleModule } from "../modules/stale.js";
 import { StatusTreeModule } from "../modules/statusTree.js";
 import { WorkerRunsModule } from "../modules/workerRuns.js";
+import { JsonStore } from "../persistence/JsonStore.js";
+import { reindex } from "../persistence/reindex.js";
 import { detectSccs } from "../traversal/scc.js";
 import { traversalPlan } from "../traversal/plan.js";
 import { topologicalOrder } from "../traversal/topo.js";
@@ -37,22 +39,19 @@ export class ReProgress {
     traversalPlan: typeof traversalPlan;
   };
 
-  private root: string;
-
-  private constructor(db: Database, root: string) {
+  private constructor(db: Database, root: string, jsonStore: JsonStore) {
     this.db = db;
-    this.root = root;
-    this.functions = new FunctionsModule(db);
-    this.edges = new EdgesModule(db);
-    this.jobs = new JobsModule(db);
-    this.workers = new WorkerRunsModule(db);
-    this.reviews = new ReviewsModule(db);
-    this.dependencies = new DependenciesModule(db);
-    this.stale = new StaleModule(db);
+    this.functions = new FunctionsModule(db, jsonStore);
+    this.edges = new EdgesModule(db, jsonStore);
+    this.jobs = new JobsModule(db, jsonStore);
+    this.workers = new WorkerRunsModule(db, jsonStore);
+    this.reviews = new ReviewsModule(db, jsonStore);
+    this.dependencies = new DependenciesModule(db, jsonStore);
+    this.stale = new StaleModule(db, jsonStore);
     this.tree = new StatusTreeModule(db);
-    this.sourceSymbols = new SourceSymbolsModule(db);
-    this.sourceBlocks = new SourceBlocksModule(db);
-    this.simplifications = new SimplificationsModule(db);
+    this.sourceSymbols = new SourceSymbolsModule(db, jsonStore);
+    this.sourceBlocks = new SourceBlocksModule(db, jsonStore);
+    this.simplifications = new SimplificationsModule(db, jsonStore);
     this.artifacts = new ArtifactsModule(root);
     this.traversal = { detectSccs, topologicalOrder, traversalPlan };
   }
@@ -61,7 +60,9 @@ export class ReProgress {
     ensureWorkdir(options.root);
     const db = openDatabase(options.root);
     runMigrations(db);
-    return new ReProgress(db, options.root);
+    const jsonStore = new JsonStore(options.root);
+    await reindex(options.root, db);
+    return new ReProgress(db, options.root, jsonStore);
   }
 
   close(): void {

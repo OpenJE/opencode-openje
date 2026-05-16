@@ -1,4 +1,4 @@
-# opencode-openje
+# opencode-re
 
 **Durable progress ledger for reverse-engineering workflows.**
 
